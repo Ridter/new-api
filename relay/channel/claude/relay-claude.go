@@ -512,7 +512,7 @@ func ResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse) *dto
 	}
 	var responseText string
 	var responseThinking string
-	if len(claudeResponse.Content) > 0 {
+	if claudeResponse.Content != nil && len(claudeResponse.Content) > 0 {
 		responseText = claudeResponse.Content[0].GetText()
 		if claudeResponse.Content[0].Thinking != nil {
 			responseThinking = *claudeResponse.Content[0].Thinking
@@ -534,25 +534,27 @@ func ResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse) *dto
 		choices = append(choices, choice)
 	} else {
 		fullTextResponse.Id = claudeResponse.Id
-		for _, message := range claudeResponse.Content {
-			switch message.Type {
-			case "tool_use":
-				args, _ := json.Marshal(message.Input)
-				tools = append(tools, dto.ToolCallResponse{
-					ID:   message.Id,
-					Type: "function", // compatible with other OpenAI derivative applications
-					Function: dto.FunctionResponse{
-						Name:      message.Name,
-						Arguments: string(args),
-					},
-				})
-			case "thinking":
-				// 加密的不管， 只输出明文的推理过程
-				if message.Thinking != nil {
-					thinkingContent = *message.Thinking
+		if claudeResponse.Content != nil {
+			for _, message := range claudeResponse.Content {
+				switch message.Type {
+				case "tool_use":
+					args, _ := json.Marshal(message.Input)
+					tools = append(tools, dto.ToolCallResponse{
+						ID:   message.Id,
+						Type: "function", // compatible with other OpenAI derivative applications
+						Function: dto.FunctionResponse{
+							Name:      message.Name,
+							Arguments: string(args),
+						},
+					})
+				case "thinking":
+					// 加密的不管， 只输出明文的推理过程
+					if message.Thinking != nil {
+						thinkingContent = *message.Thinking
+					}
+				case "text":
+					responseText = message.GetText()
 				}
-			case "text":
-				responseText = message.GetText()
 			}
 		}
 	}

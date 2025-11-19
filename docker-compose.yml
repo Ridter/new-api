@@ -16,22 +16,28 @@ version: '3.4' # For compatibility with older Docker versions
 
 services:
   new-api:
-    image: calciumion/new-api:latest
+    image: alpine:latest  # 使用轻量级 Alpine Linux
     container_name: new-api
     restart: always
-    command: --log-dir /app/logs
+    command: /app/new-api --log-dir /app/logs
     ports:
       - "3000:3000"
     volumes:
+      - ./new-api:/app/new-api:ro  # 挂载本地编译的二进制文件（只读）
       - ./data:/data
       - ./logs:/app/logs
     environment:
-      - SQL_DSN=postgresql://root:123456@postgres:5432/new-api # ⚠️ IMPORTANT: Change the password in production!
+      - SQL_DSN=postgresql://root:NLCIDMLQCd2@postgres:5432/new-api # ⚠️ IMPORTANT: Change the password in production!
 #      - SQL_DSN=root:123456@tcp(mysql:3306)/new-api  # Point to the mysql service, uncomment if using MySQL
       - REDIS_CONN_STRING=redis://redis
       - TZ=Asia/Shanghai
-      - ERROR_LOG_ENABLED=true # 是否启用错误日志记录 (Whether to enable error log recording)
+      - ERROR_LOG_ENABLED=false # 是否启用错误日志记录 (Whether to enable error log recording)
       - BATCH_UPDATE_ENABLED=true  # 是否启用批量更新 (Whether to enable batch update)
+      # Rate Limiting Configuration (访问频率限制配置)
+      - GLOBAL_WEB_RATE_LIMIT_ENABLE=false  # 禁用 Web 访问限流，避免控制台频繁访问被限制 (Disable web rate limiting to avoid console access restrictions)
+      - GLOBAL_API_RATE_LIMIT_ENABLE=false   # 保持 API 限流开启，防止滥用 (Keep API rate limiting enabled to prevent abuse)
+      - GLOBAL_API_RATE_LIMIT=300           # API 限流：180秒内最多300次请求 (API rate limit: 300 requests per 180 seconds)
+      - GLOBAL_API_RATE_LIMIT_DURATION=180  # API 限流时间窗口：180秒 (API rate limit time window: 180 seconds)
 #      - STREAMING_TIMEOUT=300  # 流模式无响应超时时间，单位秒，默认120秒，如果出现空补全可以尝试改为更大值 （Streaming timeout in seconds, default is 120s. Increase if experiencing empty completions）
 #      - SESSION_SECRET=random_string  # 多机部署时设置，必须修改这个随机字符串！！ （multi-node deployment, set this to a random string!!!!!!!）
 #      - SYNC_FREQUENCY=60  # Uncomment if regular database syncing is needed
@@ -60,7 +66,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: root
-      POSTGRES_PASSWORD: 123456  # ⚠️ IMPORTANT: Change this password in production!
+      POSTGRES_PASSWORD: NLCIDMLQCd2  # ⚠️ IMPORTANT: Change this password in production!
       POSTGRES_DB: new-api
     volumes:
       - pg_data:/var/lib/postgresql/data
