@@ -34,6 +34,17 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 			}
 			openAIRequest.Reasoning = reasoningJSON
 		} else {
+			// 对于非 OpenRouter 渠道，使用 reasoning_effort 参数
+			// 根据 budget_tokens 动态确定 reasoning_effort 级别
+			// 参考 claude-code-router 的 getThinkLevel 逻辑
+			budgetTokens := claudeRequest.Thinking.GetBudgetTokens()
+			openAIRequest.ReasoningEffort = getReasoningEffort(budgetTokens)
+
+			// 注意：reasoning_effort 与 max_tokens 不能同时使用，会导致 500 错误
+			// 因此需要清除 max_tokens
+			openAIRequest.MaxTokens = 0
+
+			// 如果原始模型名称有 -thinking 后缀，也添加到上游模型
 			thinkingSuffix := "-thinking"
 			if strings.HasSuffix(info.OriginModelName, thinkingSuffix) &&
 				!strings.HasSuffix(openAIRequest.Model, thinkingSuffix) {
@@ -336,7 +347,26 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 	if info.ClaudeConvertInfo.Done {
 		// Close any open content block
 		if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
-			claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
+			// For thinking blocks, send signature_delta first if available
+			if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
+				info.ClaudeConvertInfo.ThinkingSignature != "" {
+				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+					Index: &info.ClaudeConvertInfo.CurrentContentBlockIndex,
+					Type:  "content_block_delta",
+					Delta: &dto.ClaudeMediaMessage{
+						Type:      "signature_delta",
+						Signature: &info.ClaudeConvertInfo.ThinkingSignature,
+					},
+				})
+			}
+			// For tool blocks, close the last tool call block
+			if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeTools &&
+				info.ClaudeConvertInfo.LastToolCallIndex >= 0 {
+				prevBlockIndex := info.ClaudeConvertInfo.ToolCallIndexToContentIndex[info.ClaudeConvertInfo.LastToolCallIndex]
+				claudeResponses = append(claudeResponses, generateStopBlock(prevBlockIndex))
+			} else {
+				claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
+			}
 			info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
 		}
 
@@ -442,6 +472,13 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 
 	// Handle thinking content - IMPROVED: Support thinking with signature
 	reasoning := chosenChoice.Delta.GetReasoningContent()
+	thinkingSignature := chosenChoice.Delta.GetThinkingSignature()
+
+	// Capture signature if present (even without reasoning content)
+	if thinkingSignature != "" {
+		info.ClaudeConvertInfo.ThinkingSignature = thinkingSignature
+	}
+
 	if reasoning != "" {
 		// Close previous block if switching from non-thinking
 		if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 &&
@@ -606,6 +643,25 @@ func toJSONString(v interface{}) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// getReasoningEffort 根据 budget_tokens 动态确定 reasoning_effort 级别
+// 参考 claude-code-router 的 getThinkLevel 逻辑:
+// - budget_tokens <= 0: "none" (不启用推理)
+// - budget_tokens <= 1024: "low"
+// - budget_tokens <= 8192: "medium"
+// - budget_tokens > 8192: "high"
+func getReasoningEffort(budgetTokens int) string {
+	if budgetTokens <= 0 {
+		return "none"
+	}
+	if budgetTokens <= 1024 {
+		return "low"
+	}
+	if budgetTokens <= 8192 {
+		return "medium"
+	}
+	return "high"
 }
 
 func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycommon.RelayInfo) (*dto.GeneralOpenAIRequest, error) {

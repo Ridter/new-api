@@ -3,6 +3,7 @@ package dto
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/QuantumNous/new-api/types"
 )
@@ -84,10 +85,29 @@ type ChatCompletionsStreamResponseChoice struct {
 	Index        int                                      `json:"index"`
 }
 
+// ThinkingContent represents thinking/reasoning content with optional signature
+type ThinkingContent struct {
+	Content   string `json:"content,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+// ReasoningDetail represents a single reasoning detail from OpenRouter
+// Format: {"type": "reasoning.text", "text": "...", "signature": "...", "id": "...", "format": "...", "index": 0}
+type ReasoningDetail struct {
+	Type      string  `json:"type,omitempty"`      // e.g., "reasoning.text", "reasoning.summary", "reasoning.encrypted"
+	Text      string  `json:"text,omitempty"`      // The reasoning text content
+	Signature *string `json:"signature,omitempty"` // Optional signature for verification
+	ID        string  `json:"id,omitempty"`        // Unique identifier for this reasoning detail
+	Format    string  `json:"format,omitempty"`    // e.g., "anthropic-claude-v1"
+	Index     int     `json:"index,omitempty"`     // Index of this reasoning detail
+}
+
 type ChatCompletionsStreamResponseChoiceDelta struct {
 	Content          *string            `json:"content,omitempty"`
 	ReasoningContent *string            `json:"reasoning_content,omitempty"`
 	Reasoning        *string            `json:"reasoning,omitempty"`
+	Thinking         *ThinkingContent   `json:"thinking,omitempty"`   // CCR compatible thinking format
+	ReasoningDetails []ReasoningDetail  `json:"reasoning_details,omitempty"` // OpenRouter reasoning details format
 	Role             string             `json:"role,omitempty"`
 	ToolCalls        []ToolCallResponse `json:"tool_calls,omitempty"`
 }
@@ -104,13 +124,43 @@ func (c *ChatCompletionsStreamResponseChoiceDelta) GetContentString() string {
 }
 
 func (c *ChatCompletionsStreamResponseChoiceDelta) GetReasoningContent() string {
-	if c.ReasoningContent == nil && c.Reasoning == nil {
-		return ""
+	// Priority: ReasoningDetails > Thinking.Content > ReasoningContent > Reasoning
+	if len(c.ReasoningDetails) > 0 {
+		var texts []string
+		for _, detail := range c.ReasoningDetails {
+			if detail.Text != "" {
+				texts = append(texts, detail.Text)
+			}
+		}
+		if len(texts) > 0 {
+			return strings.Join(texts, "")
+		}
+	}
+	if c.Thinking != nil && c.Thinking.Content != "" {
+		return c.Thinking.Content
 	}
 	if c.ReasoningContent != nil {
 		return *c.ReasoningContent
 	}
-	return *c.Reasoning
+	if c.Reasoning != nil {
+		return *c.Reasoning
+	}
+	return ""
+}
+
+func (c *ChatCompletionsStreamResponseChoiceDelta) GetThinkingSignature() string {
+	// Priority: ReasoningDetails.Signature > Thinking.Signature
+	if len(c.ReasoningDetails) > 0 {
+		for _, detail := range c.ReasoningDetails {
+			if detail.Signature != nil && *detail.Signature != "" {
+				return *detail.Signature
+			}
+		}
+	}
+	if c.Thinking != nil && c.Thinking.Signature != "" {
+		return c.Thinking.Signature
+	}
+	return ""
 }
 
 func (c *ChatCompletionsStreamResponseChoiceDelta) SetReasoningContent(s string) {
