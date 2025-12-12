@@ -31,11 +31,17 @@ const (
 )
 
 type ClaudeConvertInfo struct {
-	LastMessagesType string
-	Index            int
-	Usage            *dto.Usage
-	FinishReason     string
-	Done             bool
+	LastMessagesType            string
+	Index                       int
+	Usage                       *dto.Usage
+	FinishReason                string
+	Done                        bool
+	ToolCallIndexToContentIndex map[int]int // OpenAI tool_call index -> Claude content_block index
+	HasTextContentStarted       bool        // Track if text content block has started
+	HasThinkingStarted          bool        // Track if thinking content block has started
+	CurrentContentBlockIndex    int         // Track current content block index (-1 means no active block)
+	ThinkingSignature           string      // Store thinking block signature for signature_delta
+	LastToolCallIndex           int         // Track last tool call index for proper block closing
 }
 
 type RerankerInfo struct {
@@ -288,7 +294,10 @@ func GenRelayInfoClaude(c *gin.Context, request dto.Request) *RelayInfo {
 	info.RelayFormat = types.RelayFormatClaude
 	info.ShouldIncludeUsage = false
 	info.ClaudeConvertInfo = &ClaudeConvertInfo{
-		LastMessagesType: LastMessageTypeNone,
+		LastMessagesType:            LastMessageTypeNone,
+		ToolCallIndexToContentIndex: make(map[int]int),
+		CurrentContentBlockIndex:    -1,
+		LastToolCallIndex:           -1,
 	}
 	if c.Query("beta") == "true" {
 		info.IsClaudeBetaQuery = true

@@ -201,11 +201,19 @@ func generateStopBlock(index int) *dto.ClaudeResponse {
 }
 
 func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) []*dto.ClaudeResponse {
-	if info.ClaudeConvertInfo.Done {
-		return nil
+	var claudeResponses []*dto.ClaudeResponse
+
+	// Initialize tool call index mapping if not exists
+	if info.ClaudeConvertInfo.ToolCallIndexToContentIndex == nil {
+		info.ClaudeConvertInfo.ToolCallIndexToContentIndex = make(map[int]int)
 	}
 
-	var claudeResponses []*dto.ClaudeResponse
+	// Initialize CurrentContentBlockIndex if not set
+	if info.SendResponseCount == 0 {
+		info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
+	}
+
+	// First response: Send message_start
 	if info.SendResponseCount == 1 {
 		msg := &dto.ClaudeMediaMessage{
 			Id:    openAIResponse.Id,
@@ -222,126 +230,76 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			Type:    "message_start",
 			Message: msg,
 		})
-		//claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-		//	Type: "ping",
-		//})
+
+		// Handle first response with tool calls
 		if openAIResponse.IsToolCall() {
-			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeTools
-			var toolCall dto.ToolCallResponse
-			if len(openAIResponse.Choices) > 0 && len(openAIResponse.Choices[0].Delta.ToolCalls) > 0 {
-				toolCall = openAIResponse.Choices[0].Delta.ToolCalls[0]
-			} else {
-				first := openAIResponse.GetFirstToolCall()
-				if first != nil {
-					toolCall = *first
-				} else {
-					toolCall = dto.ToolCallResponse{}
-				}
+			firstToolCall := openAIResponse.GetFirstToolCall()
+			toolCallIndex := 0
+			if firstToolCall.Index != nil {
+				toolCallIndex = *firstToolCall.Index
 			}
+
+			// Map tool call index to content block index
+			info.ClaudeConvertInfo.ToolCallIndexToContentIndex[toolCallIndex] = info.ClaudeConvertInfo.Index
+			info.ClaudeConvertInfo.CurrentContentBlockIndex = info.ClaudeConvertInfo.Index
+			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeTools
+
 			resp := &dto.ClaudeResponse{
 				Type: "content_block_start",
 				ContentBlock: &dto.ClaudeMediaMessage{
-					Id:    toolCall.ID,
+					Id:    firstToolCall.ID,
 					Type:  "tool_use",
-					Name:  toolCall.Function.Name,
+					Name:  firstToolCall.Function.Name,
 					Input: map[string]interface{}{},
 				},
 			}
-			resp.SetIndex(0)
+			resp.SetIndex(info.ClaudeConvertInfo.Index)
 			claudeResponses = append(claudeResponses, resp)
-			// 首块包含工具 delta，则追加 input_json_delta
-			if toolCall.Function.Arguments != "" {
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &info.ClaudeConvertInfo.Index,
-					Type:  "content_block_delta",
-					Delta: &dto.ClaudeMediaMessage{
-						Type:        "input_json_delta",
-						PartialJson: &toolCall.Function.Arguments,
-					},
-				})
-			}
-		} else {
-
-		}
-		// 判断首个响应是否存在内容（非标准的 OpenAI 响应）
-		if len(openAIResponse.Choices) > 0 {
-			reasoning := openAIResponse.Choices[0].Delta.GetReasoningContent()
-			content := openAIResponse.Choices[0].Delta.GetContentString()
-
-			if reasoning != "" {
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &info.ClaudeConvertInfo.Index,
-					Type:  "content_block_start",
-					ContentBlock: &dto.ClaudeMediaMessage{
-						Type:     "thinking",
-						Thinking: common.GetPointer[string](""),
-					},
-				})
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &info.ClaudeConvertInfo.Index,
-					Type:  "content_block_delta",
-					Delta: &dto.ClaudeMediaMessage{
-						Type:     "thinking_delta",
-						Thinking: &reasoning,
-					},
-				})
-				info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeThinking
-			} else if content != "" {
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &info.ClaudeConvertInfo.Index,
-					Type:  "content_block_start",
-					ContentBlock: &dto.ClaudeMediaMessage{
-						Type: "text",
-						Text: common.GetPointer[string](""),
-					},
-				})
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &info.ClaudeConvertInfo.Index,
-					Type:  "content_block_delta",
-					Delta: &dto.ClaudeMediaMessage{
-						Type: "text_delta",
-						Text: common.GetPointer[string](content),
-					},
-				})
-				info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
-			}
 		}
 
-		// 如果首块就带 finish_reason，需要立即发送停止块
-		if len(openAIResponse.Choices) > 0 && openAIResponse.Choices[0].FinishReason != nil && *openAIResponse.Choices[0].FinishReason != "" {
-			info.FinishReason = *openAIResponse.Choices[0].FinishReason
-			claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
-			oaiUsage := openAIResponse.Usage
-			if oaiUsage == nil {
-				oaiUsage = info.ClaudeConvertInfo.Usage
+		// Handle first response with text content (non-standard OpenAI response)
+		if len(openAIResponse.Choices) > 0 && len(openAIResponse.Choices[0].Delta.GetContentString()) > 0 {
+			// Close previous block if needed
+			if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 &&
+				info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeText {
+				claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
+				info.ClaudeConvertInfo.Index++
 			}
-			if oaiUsage != nil {
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Type: "message_delta",
-					Usage: &dto.ClaudeUsage{
-						InputTokens:              oaiUsage.PromptTokens,
-						OutputTokens:             oaiUsage.CompletionTokens,
-						CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
-						CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
-					},
-					Delta: &dto.ClaudeMediaMessage{
-						StopReason: common.GetPointer[string](stopReasonOpenAI2Claude(info.FinishReason)),
-					},
-				})
-			}
+
+			info.ClaudeConvertInfo.CurrentContentBlockIndex = info.ClaudeConvertInfo.Index
+			info.ClaudeConvertInfo.HasTextContentStarted = true
+			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
+
 			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-				Type: "message_stop",
+				Index: &info.ClaudeConvertInfo.Index,
+				Type:  "content_block_start",
+				ContentBlock: &dto.ClaudeMediaMessage{
+					Type: "text",
+					Text: common.GetPointer[string](""),
+				},
 			})
-			info.ClaudeConvertInfo.Done = true
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: &info.ClaudeConvertInfo.Index,
+				Type:  "content_block_delta",
+				Delta: &dto.ClaudeMediaMessage{
+					Type: "text_delta",
+					Text: common.GetPointer[string](openAIResponse.Choices[0].Delta.GetContentString()),
+				},
+			})
 		}
 		return claudeResponses
 	}
 
+	// Handle no choices (empty response or done)
 	if len(openAIResponse.Choices) == 0 {
-		// no choices
-		// 可能为非标准的 OpenAI 响应，判断是否已经完成
 		if info.ClaudeConvertInfo.Done {
-			claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
+			// Close any open content block
+			if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+				claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
+				info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
+			}
+
+			// Send usage and stop
 			oaiUsage := info.ClaudeConvertInfo.Usage
 			if oaiUsage != nil {
 				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
@@ -362,132 +320,222 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			})
 		}
 		return claudeResponses
-	} else {
-		chosenChoice := openAIResponse.Choices[0]
-		doneChunk := chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != ""
-		if doneChunk {
-			info.FinishReason = *chosenChoice.FinishReason
+	}
+
+	chosenChoice := openAIResponse.Choices[0]
+
+	// Check for finish reason
+	if chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != "" {
+		info.FinishReason = *chosenChoice.FinishReason
+		if !info.ClaudeConvertInfo.Done {
+			return claudeResponses
+		}
+	}
+
+	// Handle done state
+	if info.ClaudeConvertInfo.Done {
+		// Close any open content block
+		if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+			claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
+			info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
 		}
 
-		var claudeResponse dto.ClaudeResponse
-		var isEmpty bool
-		claudeResponse.Type = "content_block_delta"
-		if len(chosenChoice.Delta.ToolCalls) > 0 {
-			toolCalls := chosenChoice.Delta.ToolCalls
-			if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeTools {
-				claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
-				info.ClaudeConvertInfo.Index++
-			}
-			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeTools
+		oaiUsage := info.ClaudeConvertInfo.Usage
+		if oaiUsage != nil {
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Type: "message_delta",
+				Usage: &dto.ClaudeUsage{
+					InputTokens:              oaiUsage.PromptTokens,
+					OutputTokens:             oaiUsage.CompletionTokens,
+					CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
+					CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
+				},
+				Delta: &dto.ClaudeMediaMessage{
+					StopReason: common.GetPointer[string](stopReasonOpenAI2Claude(info.FinishReason)),
+				},
+			})
+		}
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Type: "message_stop",
+		})
+		return claudeResponses
+	}
 
-			for i, toolCall := range toolCalls {
-				blockIndex := info.ClaudeConvertInfo.Index
-				if toolCall.Index != nil {
-					blockIndex = *toolCall.Index
-				} else if len(toolCalls) > 1 {
-					blockIndex = info.ClaudeConvertInfo.Index + i
+	// Handle tool calls - IMPROVED: Support multiple tool calls with index mapping
+	if len(chosenChoice.Delta.ToolCalls) > 0 {
+		for _, toolCall := range chosenChoice.Delta.ToolCalls {
+			toolCallIndex := 0
+			if toolCall.Index != nil {
+				toolCallIndex = *toolCall.Index
+			}
+
+			// Check if this is a new tool call
+			contentBlockIndex, exists := info.ClaudeConvertInfo.ToolCallIndexToContentIndex[toolCallIndex]
+			if !exists {
+				// Close previous tool call block if switching to a new tool call
+				if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeTools &&
+					info.ClaudeConvertInfo.LastToolCallIndex >= 0 &&
+					info.ClaudeConvertInfo.LastToolCallIndex != toolCallIndex {
+					prevBlockIndex := info.ClaudeConvertInfo.ToolCallIndexToContentIndex[info.ClaudeConvertInfo.LastToolCallIndex]
+					claudeResponses = append(claudeResponses, generateStopBlock(prevBlockIndex))
+				} else if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 &&
+					info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeTools {
+					// Close previous non-tool content block (thinking/text)
+					// For thinking blocks, send signature_delta first if available
+					if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
+						info.ClaudeConvertInfo.ThinkingSignature != "" {
+						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+							Index: &info.ClaudeConvertInfo.CurrentContentBlockIndex,
+							Type:  "content_block_delta",
+							Delta: &dto.ClaudeMediaMessage{
+								Type:      "signature_delta",
+								Signature: &info.ClaudeConvertInfo.ThinkingSignature,
+							},
+						})
+					}
+					claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
 				}
 
-				idx := blockIndex
+				// Start new tool use block
+				info.ClaudeConvertInfo.Index++
+				contentBlockIndex = info.ClaudeConvertInfo.Index
+				info.ClaudeConvertInfo.ToolCallIndexToContentIndex[toolCallIndex] = contentBlockIndex
+				info.ClaudeConvertInfo.CurrentContentBlockIndex = contentBlockIndex
+				info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeTools
+				info.ClaudeConvertInfo.LastToolCallIndex = toolCallIndex
+
+				toolCallID := toolCall.ID
+				if toolCallID == "" {
+					toolCallID = "call_" + string(rune(toolCallIndex))
+				}
+				toolCallName := toolCall.Function.Name
+				if toolCallName == "" {
+					toolCallName = "tool_" + string(rune(toolCallIndex))
+				}
+
 				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx,
+					Index: &contentBlockIndex,
 					Type:  "content_block_start",
 					ContentBlock: &dto.ClaudeMediaMessage{
-						Id:    toolCall.ID,
+						Id:    toolCallID,
 						Type:  "tool_use",
-						Name:  toolCall.Function.Name,
+						Name:  toolCallName,
 						Input: map[string]interface{}{},
 					},
 				})
+			}
 
+			// Send tool arguments delta
+			if toolCall.Function.Arguments != "" {
 				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &idx,
+					Index: &contentBlockIndex,
 					Type:  "content_block_delta",
 					Delta: &dto.ClaudeMediaMessage{
 						Type:        "input_json_delta",
 						PartialJson: &toolCall.Function.Arguments,
 					},
 				})
-
-				info.ClaudeConvertInfo.Index = blockIndex
-			}
-		} else {
-			reasoning := chosenChoice.Delta.GetReasoningContent()
-			textContent := chosenChoice.Delta.GetContentString()
-			if reasoning != "" || textContent != "" {
-				if reasoning != "" {
-					if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeThinking {
-						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-							Index: &info.ClaudeConvertInfo.Index,
-							Type:  "content_block_start",
-							ContentBlock: &dto.ClaudeMediaMessage{
-								Type:     "thinking",
-								Thinking: common.GetPointer[string](""),
-							},
-						})
-					}
-					info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeThinking
-					claudeResponse.Delta = &dto.ClaudeMediaMessage{
-						Type:     "thinking_delta",
-						Thinking: &reasoning,
-					}
-				} else {
-					if info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeText {
-						if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking || info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeTools {
-							claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
-							info.ClaudeConvertInfo.Index++
-						}
-						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-							Index: &info.ClaudeConvertInfo.Index,
-							Type:  "content_block_start",
-							ContentBlock: &dto.ClaudeMediaMessage{
-								Type: "text",
-								Text: common.GetPointer[string](""),
-							},
-						})
-					}
-					info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
-					claudeResponse.Delta = &dto.ClaudeMediaMessage{
-						Type: "text_delta",
-						Text: common.GetPointer[string](textContent),
-					}
-				}
-			} else {
-				isEmpty = true
 			}
 		}
+		return claudeResponses
+	}
 
-		claudeResponse.Index = &info.ClaudeConvertInfo.Index
-		if !isEmpty && claudeResponse.Delta != nil {
-			claudeResponses = append(claudeResponses, &claudeResponse)
+	// Handle thinking content - IMPROVED: Support thinking with signature
+	reasoning := chosenChoice.Delta.GetReasoningContent()
+	if reasoning != "" {
+		// Close previous block if switching from non-thinking
+		if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 &&
+			info.ClaudeConvertInfo.LastMessagesType != relaycommon.LastMessageTypeThinking {
+			claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
+			info.ClaudeConvertInfo.Index++
 		}
 
-		if doneChunk || info.ClaudeConvertInfo.Done {
-			claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.Index))
-			oaiUsage := openAIResponse.Usage
-			if oaiUsage == nil {
-				oaiUsage = info.ClaudeConvertInfo.Usage
-			}
-			if oaiUsage != nil {
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Type: "message_delta",
-					Usage: &dto.ClaudeUsage{
-						InputTokens:              oaiUsage.PromptTokens,
-						OutputTokens:             oaiUsage.CompletionTokens,
-						CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
-						CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
-					},
-					Delta: &dto.ClaudeMediaMessage{
-						StopReason: common.GetPointer[string](stopReasonOpenAI2Claude(info.FinishReason)),
-					},
-				})
-			}
+		// Start thinking block if not started
+		if !info.ClaudeConvertInfo.HasThinkingStarted {
+			info.ClaudeConvertInfo.CurrentContentBlockIndex = info.ClaudeConvertInfo.Index
+			info.ClaudeConvertInfo.HasThinkingStarted = true
+			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeThinking
+
 			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-				Type: "message_stop",
+				Index: &info.ClaudeConvertInfo.Index,
+				Type:  "content_block_start",
+				ContentBlock: &dto.ClaudeMediaMessage{
+					Type:     "thinking",
+					Thinking: common.GetPointer[string](""),
+				},
 			})
-			info.ClaudeConvertInfo.Done = true
-			return claudeResponses
 		}
+
+		// Send thinking delta
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Index: &info.ClaudeConvertInfo.Index,
+			Type:  "content_block_delta",
+			Delta: &dto.ClaudeMediaMessage{
+				Type:     "thinking_delta",
+				Thinking: &reasoning,
+			},
+		})
+		return claudeResponses
+	}
+
+	// Handle text content - IMPROVED: Precise content block switching
+	textContent := chosenChoice.Delta.GetContentString()
+	if textContent != "" {
+		// Close previous block if switching from thinking/tools to text
+		if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+			isCurrentTextBlock := info.ClaudeConvertInfo.HasTextContentStarted &&
+				info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeText
+			if !isCurrentTextBlock {
+				// For thinking blocks, send signature_delta first if available
+				if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
+					info.ClaudeConvertInfo.ThinkingSignature != "" {
+					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+						Index: &info.ClaudeConvertInfo.CurrentContentBlockIndex,
+						Type:  "content_block_delta",
+						Delta: &dto.ClaudeMediaMessage{
+							Type:      "signature_delta",
+							Signature: &info.ClaudeConvertInfo.ThinkingSignature,
+						},
+					})
+				}
+				// For tool blocks, close the last tool call block
+				if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeTools &&
+					info.ClaudeConvertInfo.LastToolCallIndex >= 0 {
+					prevBlockIndex := info.ClaudeConvertInfo.ToolCallIndexToContentIndex[info.ClaudeConvertInfo.LastToolCallIndex]
+					claudeResponses = append(claudeResponses, generateStopBlock(prevBlockIndex))
+				} else {
+					claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
+				}
+				info.ClaudeConvertInfo.Index++
+				info.ClaudeConvertInfo.HasTextContentStarted = false
+			}
+		}
+
+		// Start text block if not started
+		if !info.ClaudeConvertInfo.HasTextContentStarted {
+			info.ClaudeConvertInfo.CurrentContentBlockIndex = info.ClaudeConvertInfo.Index
+			info.ClaudeConvertInfo.HasTextContentStarted = true
+			info.ClaudeConvertInfo.LastMessagesType = relaycommon.LastMessageTypeText
+
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: &info.ClaudeConvertInfo.Index,
+				Type:  "content_block_start",
+				ContentBlock: &dto.ClaudeMediaMessage{
+					Type: "text",
+					Text: common.GetPointer[string](""),
+				},
+			})
+		}
+
+		// Send text delta
+		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+			Index: &info.ClaudeConvertInfo.Index,
+			Type:  "content_block_delta",
+			Delta: &dto.ClaudeMediaMessage{
+				Type: "text_delta",
+				Text: common.GetPointer[string](textContent),
+			},
+		})
 	}
 
 	return claudeResponses
