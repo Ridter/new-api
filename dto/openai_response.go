@@ -102,12 +102,27 @@ type ReasoningDetail struct {
 	Index     int     `json:"index,omitempty"`     // Index of this reasoning detail
 }
 
+// ReasoningDetailExtra represents reasoning detail from Tencent Copilot API
+// Format: {"content_signature": "...", "toolcall_signature": "...", "text": "...", "model": "..."}
+type ReasoningDetailExtra struct {
+	ContentSignature  string `json:"content_signature,omitempty"`
+	ToolcallSignature string `json:"toolcall_signature,omitempty"`
+	Text              string `json:"text,omitempty"`
+	Model             string `json:"model,omitempty"`
+}
+
+// ExtraFields represents extra fields from Tencent Copilot API response
+type ExtraFields struct {
+	ReasoningDetail *ReasoningDetailExtra `json:"reasoning_detail,omitempty"`
+}
+
 type ChatCompletionsStreamResponseChoiceDelta struct {
 	Content          *string            `json:"content,omitempty"`
 	ReasoningContent *string            `json:"reasoning_content,omitempty"`
 	Reasoning        *string            `json:"reasoning,omitempty"`
-	Thinking         *ThinkingContent   `json:"thinking,omitempty"`   // CCR compatible thinking format
+	Thinking         *ThinkingContent   `json:"thinking,omitempty"`          // CCR compatible thinking format
 	ReasoningDetails []ReasoningDetail  `json:"reasoning_details,omitempty"` // OpenRouter reasoning details format
+	ExtraFields      *ExtraFields       `json:"extra_fields,omitempty"`      // Tencent Copilot API extra fields
 	Role             string             `json:"role,omitempty"`
 	ToolCalls        []ToolCallResponse `json:"tool_calls,omitempty"`
 }
@@ -149,7 +164,10 @@ func (c *ChatCompletionsStreamResponseChoiceDelta) GetReasoningContent() string 
 }
 
 func (c *ChatCompletionsStreamResponseChoiceDelta) GetThinkingSignature() string {
-	// Priority: ReasoningDetails.Signature > Thinking.Signature
+	// Priority: ExtraFields.ReasoningDetail.ContentSignature > ReasoningDetails.Signature > Thinking.Signature
+	if c.ExtraFields != nil && c.ExtraFields.ReasoningDetail != nil && c.ExtraFields.ReasoningDetail.ContentSignature != "" {
+		return c.ExtraFields.ReasoningDetail.ContentSignature
+	}
 	if len(c.ReasoningDetails) > 0 {
 		for _, detail := range c.ReasoningDetails {
 			if detail.Signature != nil && *detail.Signature != "" {

@@ -4,14 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-New API is a next-generation AI model gateway and asset management system built as a fork of [One API](https://github.com/songquanpeng/one-api). It serves as a unified API gateway that aggregates 30+ AI service providers (OpenAI, Claude, Gemini, AWS Bedrock, etc.) into a single OpenAI-compatible interface with advanced management, billing, and routing capabilities.
+New API is a next-generation AI model gateway and asset management system built as a fork of [One API](https://github.com/songquanpeng/one-api). It serves as a unified API gateway that aggregates 30+ AI service providers into a single OpenAI-compatible interface with advanced management, billing, and routing capabilities.
+
+**Supported Providers:** OpenAI, Claude, Gemini, AWS Bedrock, Vertex AI, DeepSeek, Cohere, Mistral, Moonshot, Ollama, xAI, Cloudflare, Baidu, Ali, Tencent, Zhipu, Volcengine, Xunfei, MiniMax, Jina, Dify, Coze, Replicate, SiliconFlow, Perplexity, and more.
 
 **Tech Stack:**
-- Backend: Go 1.25.1 + Gin framework + GORM
-- Frontend: React 18.2.0 + Semi Design + Vite
+- Backend: Go 1.25+ + Gin framework + GORM
+- Frontend: React 18.2.0 + Semi Design + Vite + TailwindCSS
 - Database: SQLite (default), MySQL 5.7.8+, or PostgreSQL 9.6+
 - Caching: Redis (optional) or in-memory cache
-- Deployment: Single binary with embedded frontend
+- Deployment: Single binary with embedded frontend (default port: 3000)
 
 ## Development Commands
 
@@ -120,7 +122,7 @@ Model/Data Layer (GORM, caching)
   - `relay.go` - Main relay handler that routes to appropriate helper
   - `channel.go`, `token.go`, `user.go` - CRUD operations
 - `service/` - Business logic (quota management, token counting, webhooks)
-- `relay/` - Provider adapters (30+ providers)
+- `relay/` - Provider adapters (40+ providers)
   - `relay/channel/*/adaptor.go` - Provider-specific request/response transformation
   - Each adapter implements common interface for streaming, error handling
 - `model/` - GORM database models and caching
@@ -284,19 +286,13 @@ For running multiple instances:
 
 ## Testing
 
-The project has minimal test coverage. Existing tests:
+The project has minimal test coverage. Run tests with:
 
 ```bash
-# Run Go tests
 go test ./...
-
-# Run specific test file
-go test ./controller -run TestChannelTest
 ```
 
-Test files found:
-- [controller/misc.go](controller/misc.go) - Miscellaneous tests
-- [controller/channel-test.go](controller/channel-test.go) - Channel testing logic
+Channel testing is available via the admin dashboard UI (not unit tests).
 
 ## Common Development Workflows
 
@@ -338,7 +334,6 @@ Test files found:
 - Official docs: https://docs.newapi.pro/
 - API documentation: https://docs.newapi.pro/api
 - Environment variables: https://docs.newapi.pro/installation/environment-variables
-- FAQ: https://docs.newapi.pro/support/faq
 
 ## Notes
 
@@ -347,4 +342,3 @@ Test files found:
 - Default admin credentials created on first run (check logs)
 - Channel health monitoring runs automatically in background
 - Configuration hot-reloads via `model.SyncOptions()` goroutine
-- LinuxDO OAuth endpoints are hardcoded in `.env.example`

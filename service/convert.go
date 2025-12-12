@@ -306,6 +306,19 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 		if info.ClaudeConvertInfo.Done {
 			// Close any open content block
 			if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+				// For thinking blocks, send signature_delta first if available
+				if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
+					info.ClaudeConvertInfo.ThinkingSignature != "" {
+					thinkingBlockIndex := info.ClaudeConvertInfo.CurrentContentBlockIndex
+					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+						Index: common.GetPointer[int](thinkingBlockIndex),
+						Type:  "content_block_delta",
+						Delta: &dto.ClaudeMediaMessage{
+							Type:      "signature_delta",
+							Signature: &info.ClaudeConvertInfo.ThinkingSignature,
+						},
+					})
+				}
 				claudeResponses = append(claudeResponses, generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex))
 				info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
 			}
@@ -335,12 +348,20 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 
 	chosenChoice := openAIResponse.Choices[0]
 
+	// Capture signature if present (even when finish_reason is set)
+	// This ensures we don't miss the signature when it arrives with finish_reason
+	thinkingSignature := chosenChoice.Delta.GetThinkingSignature()
+	if thinkingSignature != "" {
+		info.ClaudeConvertInfo.ThinkingSignature = thinkingSignature
+	}
+
 	// Check for finish reason
+	// Note: When finish_reason is received, we should NOT return early if Done is false.
+	// Instead, we should continue processing any remaining content (like signature) in this response,
+	// and let HandleFinalResponse handle the final message_stop event.
 	if chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != "" {
 		info.FinishReason = *chosenChoice.FinishReason
-		if !info.ClaudeConvertInfo.Done {
-			return claudeResponses
-		}
+		// Don't return early here - continue processing to handle any content in this response
 	}
 
 	// Handle done state
@@ -350,8 +371,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			// For thinking blocks, send signature_delta first if available
 			if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
 				info.ClaudeConvertInfo.ThinkingSignature != "" {
+				thinkingBlockIndex := info.ClaudeConvertInfo.CurrentContentBlockIndex
 				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Index: &info.ClaudeConvertInfo.CurrentContentBlockIndex,
+					Index: common.GetPointer[int](thinkingBlockIndex),
 					Type:  "content_block_delta",
 					Delta: &dto.ClaudeMediaMessage{
 						Type:      "signature_delta",
@@ -414,8 +436,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 					// For thinking blocks, send signature_delta first if available
 					if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
 						info.ClaudeConvertInfo.ThinkingSignature != "" {
+						thinkingBlockIndex := info.ClaudeConvertInfo.CurrentContentBlockIndex
 						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-							Index: &info.ClaudeConvertInfo.CurrentContentBlockIndex,
+							Index: common.GetPointer[int](thinkingBlockIndex),
 							Type:  "content_block_delta",
 							Delta: &dto.ClaudeMediaMessage{
 								Type:      "signature_delta",
@@ -472,12 +495,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 
 	// Handle thinking content - IMPROVED: Support thinking with signature
 	reasoning := chosenChoice.Delta.GetReasoningContent()
-	thinkingSignature := chosenChoice.Delta.GetThinkingSignature()
 
-	// Capture signature if present (even without reasoning content)
-	if thinkingSignature != "" {
-		info.ClaudeConvertInfo.ThinkingSignature = thinkingSignature
-	}
+	// Note: thinkingSignature is already captured above (line 352-355) to handle
+	// the case where signature arrives with finish_reason
 
 	if reasoning != "" {
 		// Close previous block if switching from non-thinking
@@ -526,8 +546,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				// For thinking blocks, send signature_delta first if available
 				if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
 					info.ClaudeConvertInfo.ThinkingSignature != "" {
+					thinkingBlockIndex := info.ClaudeConvertInfo.CurrentContentBlockIndex
 					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-						Index: &info.ClaudeConvertInfo.CurrentContentBlockIndex,
+						Index: common.GetPointer[int](thinkingBlockIndex),
 						Type:  "content_block_delta",
 						Delta: &dto.ClaudeMediaMessage{
 							Type:      "signature_delta",

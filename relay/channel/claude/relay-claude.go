@@ -448,6 +448,12 @@ func StreamResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse
 				if claudeResponse.ContentBlock.Type == "text" && claudeResponse.ContentBlock.Text != nil {
 					choice.Delta.SetContentString(*claudeResponse.ContentBlock.Text)
 				}
+				if claudeResponse.ContentBlock.Type == "thinking" {
+					// thinking 块开始，初始化 reasoning content
+					if claudeResponse.ContentBlock.Thinking != nil {
+						choice.Delta.ReasoningContent = claudeResponse.ContentBlock.Thinking
+					}
+				}
 				if claudeResponse.ContentBlock.Type == "tool_use" {
 					tools = append(tools, dto.ToolCallResponse{
 						Index: common.GetPointer(fcIdx),
@@ -488,6 +494,10 @@ func StreamResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse
 				choice.FinishReason = &finishReason
 			}
 			//claudeUsage = &claudeResponse.Usage
+		} else if claudeResponse.Type == "content_block_stop" {
+			// content_block_stop 事件表示一个内容块结束，不需要返回数据
+			// 但需要继续处理后续事件，不能返回 nil 中断流
+			return &response
 		} else if claudeResponse.Type == "message_stop" {
 			return nil
 		} else {
