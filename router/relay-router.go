@@ -64,6 +64,10 @@ func SetRelayRouter(router *gin.Engine) {
 	relayV1Router.Use(middleware.TokenAuth())
 	relayV1Router.Use(middleware.ModelRequestRateLimit())
 	{
+		// count_tokens 路由不需要 Distribute 中间件，因为不需要选择渠道
+		relayV1Router.POST("/messages/count_tokens", controller.ClaudeCountTokens)
+	}
+	{
 		// WebSocket 路由（统一到 Relay）
 		wsRouter := relayV1Router.Group("")
 		wsRouter.Use(middleware.Distribute())
