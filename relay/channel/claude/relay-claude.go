@@ -445,16 +445,22 @@ func StreamResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse
 		} else if claudeResponse.Type == "content_block_start" {
 			if claudeResponse.ContentBlock != nil {
 				// 如果是文本块，尽可能发送首段文本（若存在）
-				if claudeResponse.ContentBlock.Type == "text" && claudeResponse.ContentBlock.Text != nil {
-					choice.Delta.SetContentString(*claudeResponse.ContentBlock.Text)
-				}
-				if claudeResponse.ContentBlock.Type == "thinking" {
-					// thinking 块开始，初始化 reasoning content
-					if claudeResponse.ContentBlock.Thinking != nil {
-						choice.Delta.ReasoningContent = claudeResponse.ContentBlock.Thinking
+				if claudeResponse.ContentBlock.Type == "text" {
+					if claudeResponse.ContentBlock.Text != nil && *claudeResponse.ContentBlock.Text != "" {
+						choice.Delta.SetContentString(*claudeResponse.ContentBlock.Text)
+					} else {
+						// text 块开始但没有初始内容，不发送
+						return nil
 					}
-				}
-				if claudeResponse.ContentBlock.Type == "tool_use" {
+				} else if claudeResponse.ContentBlock.Type == "thinking" {
+					// thinking 块开始，初始化 reasoning content
+					if claudeResponse.ContentBlock.Thinking != nil && *claudeResponse.ContentBlock.Thinking != "" {
+						choice.Delta.ReasoningContent = claudeResponse.ContentBlock.Thinking
+					} else {
+						// thinking 块开始但没有初始内容，不发送
+						return nil
+					}
+				} else if claudeResponse.ContentBlock.Type == "tool_use" {
 					tools = append(tools, dto.ToolCallResponse{
 						Index: common.GetPointer(fcIdx),
 						ID:    claudeResponse.ContentBlock.Id,
@@ -464,6 +470,9 @@ func StreamResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse
 							Arguments: "",
 						},
 					})
+				} else {
+					// 未知的 content block 类型，跳过
+					return nil
 				}
 			} else {
 				return nil
@@ -496,8 +505,7 @@ func StreamResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse
 			//claudeUsage = &claudeResponse.Usage
 		} else if claudeResponse.Type == "content_block_stop" {
 			// content_block_stop 事件表示一个内容块结束，不需要返回数据
-			// 但需要继续处理后续事件，不能返回 nil 中断流
-			return &response
+			return nil
 		} else if claudeResponse.Type == "message_stop" {
 			return nil
 		} else {
@@ -630,6 +638,10 @@ func FormatClaudeResponseInfo(requestMode int, claudeResponse *dto.ClaudeRespons
 			// 判断是否完整
 			claudeInfo.Done = true
 		} else if claudeResponse.Type == "content_block_start" {
+			// content_block_start 事件，可能需要继续处理但不一定发送数据
+		} else if claudeResponse.Type == "content_block_stop" {
+			// content_block_stop 事件，不需要发送数据，但继续处理流
+			return false
 		} else {
 			return false
 		}

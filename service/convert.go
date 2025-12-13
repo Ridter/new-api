@@ -190,8 +190,30 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 				openAIMessage.SetToolCalls(toolCalls)
 			}
 
-			if len(mediaMessages) > 0 && len(toolCalls) == 0 {
-				openAIMessage.SetMediaContent(mediaMessages)
+			if len(mediaMessages) > 0 {
+				// For assistant messages with tool_calls, use string content format
+				// to ensure compatibility with OpenAI API providers
+				// Array format content may be ignored by some providers when tool_calls exist
+				if claudeMessage.Role == "assistant" && len(toolCalls) > 0 {
+					// Check if mediaMessages contains only text (no images)
+					onlyText := true
+					var textContent string
+					for _, media := range mediaMessages {
+						if media.Type == "text" {
+							textContent += media.Text
+						} else {
+							onlyText = false
+							break
+						}
+					}
+					if onlyText && textContent != "" {
+						openAIMessage.SetStringContent(textContent)
+					} else {
+						openAIMessage.SetMediaContent(mediaMessages)
+					}
+				} else {
+					openAIMessage.SetMediaContent(mediaMessages)
+				}
 			}
 		}
 		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 {
@@ -450,7 +472,10 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				}
 
 				// Start new tool use block
-				info.ClaudeConvertInfo.Index++
+				// Only increment Index if we already have a content block
+				if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+					info.ClaudeConvertInfo.Index++
+				}
 				contentBlockIndex = info.ClaudeConvertInfo.Index
 				info.ClaudeConvertInfo.ToolCallIndexToContentIndex[toolCallIndex] = contentBlockIndex
 				info.ClaudeConvertInfo.CurrentContentBlockIndex = contentBlockIndex
@@ -610,24 +635,25 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 	}
 	for _, choice := range openAIResponse.Choices {
 		stopReason = stopReasonOpenAI2Claude(choice.FinishReason)
-		if choice.FinishReason == "tool_calls" {
-			for _, toolUse := range choice.Message.ParseToolCalls() {
-				claudeContent := dto.ClaudeMediaMessage{}
-				claudeContent.Type = "tool_use"
-				claudeContent.Id = toolUse.ID
-				claudeContent.Name = toolUse.Function.Name
-				var mapParams map[string]interface{}
-				if err := common.Unmarshal([]byte(toolUse.Function.Arguments), &mapParams); err == nil {
-					claudeContent.Input = mapParams
-				} else {
-					claudeContent.Input = toolUse.Function.Arguments
-				}
-				contents = append(contents, claudeContent)
-			}
-		} else {
+		if choice.Message.StringContent() != "" {
 			claudeContent := dto.ClaudeMediaMessage{}
 			claudeContent.Type = "text"
 			claudeContent.SetText(choice.Message.StringContent())
+			contents = append(contents, claudeContent)
+		}
+		// Handle tool calls
+		toolCalls := choice.Message.ParseToolCalls()
+		for _, toolUse := range toolCalls {
+			claudeContent := dto.ClaudeMediaMessage{}
+			claudeContent.Type = "tool_use"
+			claudeContent.Id = toolUse.ID
+			claudeContent.Name = toolUse.Function.Name
+			var mapParams map[string]interface{}
+			if err := common.Unmarshal([]byte(toolUse.Function.Arguments), &mapParams); err == nil {
+				claudeContent.Input = mapParams
+			} else {
+				claudeContent.Input = toolUse.Function.Arguments
+			}
 			contents = append(contents, claudeContent)
 		}
 	}

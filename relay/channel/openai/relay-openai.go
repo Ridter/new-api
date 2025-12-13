@@ -175,6 +175,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		if shouldSendLastResp {
 			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 		}
+	} else if info.RelayFormat == types.RelayFormatClaude {
+		// 对于 Claude 格式，先处理 lastStreamData 的内容（Done=false），再在 HandleFinalResponse 中发送结束事件
+		_ = HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 	}
 
 	// 处理token计算

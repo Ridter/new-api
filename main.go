@@ -256,5 +256,13 @@ func InitResources() error {
 	if err != nil {
 		return err
 	}
+
+	// Initialize Messages Logger
+	err = middleware.InitMessagesLogger()
+	if err != nil {
+		common.SysLog("failed to initialize messages logger: " + err.Error())
+		// 非致命错误，继续执行
+	}
+
 	return nil
 }

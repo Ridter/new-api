@@ -81,7 +81,7 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.Use(middleware.Distribute())
 
 		// claude related routes
-		httpRouter.POST("/messages", func(c *gin.Context) {
+		httpRouter.POST("/messages", middleware.MessagesLogger(), func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatClaude)
 		})
 

@@ -31,6 +31,8 @@ services:
 #      - SQL_DSN=root:123456@tcp(mysql:3306)/new-api  # Point to the mysql service, uncomment if using MySQL
       - REDIS_CONN_STRING=redis://redis
       - TZ=Asia/Shanghai
+      - MESSAGES_LOG_ENABLED=false  # 是否启用消息日志记录 (Whether to enable messages log recording)
+      - MESSAGES_LOG_DIR=/data/messages  # 消息日志目录 (Messages log directory)
       - ERROR_LOG_ENABLED=false # 是否启用错误日志记录 (Whether to enable error log recording)
       - BATCH_UPDATE_ENABLED=true  # 是否启用批量更新 (Whether to enable batch update)
       # Rate Limiting Configuration (访问频率限制配置)

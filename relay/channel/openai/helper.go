@@ -209,15 +209,11 @@ func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStream
 
 	case types.RelayFormatClaude:
 		info.ClaudeConvertInfo.Done = true
-		var streamResponse dto.ChatCompletionsStreamResponse
-		if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
-			common.SysLog("error unmarshalling stream response: " + err.Error())
-			return
-		}
-
 		info.ClaudeConvertInfo.Usage = usage
 
-		claudeResponses := service.StreamResponseOpenAI2Claude(&streamResponse, info)
+		// 只发送结束事件，不再重复处理 lastStreamData 的内容
+		// lastStreamData 的内容已经在 HandleStreamFormat 中处理过了
+		claudeResponses := service.StreamResponseOpenAI2Claude(&dto.ChatCompletionsStreamResponse{}, info)
 		for _, resp := range claudeResponses {
 			_ = helper.ClaudeData(c, *resp)
 		}
