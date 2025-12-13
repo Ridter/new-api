@@ -42,6 +42,7 @@ type ClaudeConvertInfo struct {
 	CurrentContentBlockIndex    int         // Track current content block index (-1 means no active block)
 	ThinkingSignature           string      // Store thinking block signature for signature_delta
 	LastToolCallIndex           int         // Track last tool call index for proper block closing
+	HasContentBlockStarted      bool        // Track if any content_block_start has been sent (to prevent orphan stop blocks)
 }
 
 type RerankerInfo struct {

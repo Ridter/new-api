@@ -281,14 +281,15 @@ func (r *GeneralOpenAIRequest) ParseInput() []string {
 }
 
 type Message struct {
-	Role             string          `json:"role"`
-	Content          any             `json:"content"`
-	Name             *string         `json:"name,omitempty"`
-	Prefix           *bool           `json:"prefix,omitempty"`
-	ReasoningContent string          `json:"reasoning_content,omitempty"`
-	Reasoning        string          `json:"reasoning,omitempty"`
-	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
-	ToolCallId       string          `json:"tool_call_id,omitempty"`
+	Role             string           `json:"role"`
+	Content          any              `json:"content"`
+	Name             *string          `json:"name,omitempty"`
+	Prefix           *bool            `json:"prefix,omitempty"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	Reasoning        string           `json:"reasoning,omitempty"`
+	ToolCalls        json.RawMessage  `json:"tool_calls,omitempty"`
+	ToolCallId       string           `json:"tool_call_id,omitempty"`
+	Thinking         *ThinkingContent `json:"thinking,omitempty"` // Claude extended thinking 透传
 	parsedContent    []MediaContent
 	//parsedStringContent *string
 }
