@@ -22,6 +22,8 @@ go run main.go                    # Run development server
 go build -o new-api main.go       # Build binary
 DEBUG=true go run main.go         # Enable debug logging
 go test ./...                     # Run tests (minimal coverage)
+go test -v ./path/to/package      # Run tests for specific package
+go test -run TestName ./...       # Run specific test by name
 ```
 
 ### Frontend (React)
@@ -63,20 +65,24 @@ HTTP Request → Gin Router → Middleware Chain → Controller → Relay Layer 
 ### Backend Structure
 
 - `main.go` - Entry point, initializes resources and starts server
-- `router/` - Route definitions (API, relay, dashboard)
+- `router/` - Route definitions (API, relay, dashboard, video)
 - `middleware/` - HTTP middleware chain
   - `distributor.go` - **Critical**: Channel selection and load balancing
   - `auth.go` - Token/user authentication
   - `rate-limit.go` - Request throttling
 - `controller/` - HTTP request handlers
-  - `relay.go` - Main relay handler routing to appropriate helper
-- `service/` - Business logic (quota management, token counting)
-- `relay/` - Provider adapters (30+ providers including OpenAI, Claude, Gemini, AWS Bedrock, Azure, etc.)
-  - `relay/channel/*/adaptor.go` - Provider-specific request/response transformation
+  - `relay.go` - Main relay handler routing to appropriate helper based on RelayMode
+- `service/` - Business logic
+  - `channel_select.go` - Channel selection algorithm (weighted random)
+  - `quota.go` - Quota management and billing
+  - `convert.go` - Format conversion (Claude ⇄ OpenAI, Gemini ⇄ OpenAI)
+  - `token_counter.go` - Token counting with tiktoken-go
+- `relay/` - Provider adapters (30+ providers)
+  - `relay/channel/adapter.go` - Core `Adaptor` and `TaskAdaptor` interfaces
+  - `relay/channel/*/adaptor.go` - Provider-specific implementations
 - `model/` - GORM database models and caching
-  - `channel_cache.go` - In-memory channel caching
 - `dto/` - Data transfer objects for API requests/responses
-- `constant/` - Channel type constants and configuration
+- `constant/channel.go` - Channel type constants (ChannelTypeOpenAI, ChannelTypeAnthropic, etc.)
 
 ### Frontend Structure
 
@@ -92,11 +98,18 @@ web/src/
 
 ### Key Patterns
 
-**Adapter Pattern** - Each AI provider has an adapter in `relay/channel/*/adaptor.go` implementing request/response transformation and streaming.
+**Adaptor Interface** - Core interface in `relay/channel/adapter.go`:
+- `Adaptor` - For synchronous requests (chat, embeddings, audio, images)
+- `TaskAdaptor` - For async tasks (video generation, Midjourney, Suno)
 
 **Middleware Chain** - Requests flow through: CORS → Stats → TokenAuth → RateLimit → Distribute → Controller.
 
-**Channel Selection** - `middleware/distributor.go` uses weighted random algorithm based on channel priority, model availability, user group permissions, and health status.
+**Channel Selection** - `service/channel_select.go` uses weighted random algorithm based on channel priority, model availability, user group permissions, and health status.
+
+**Format Conversion** - Automatic conversion between API formats:
+- Claude Messages ⇄ OpenAI Chat Completions
+- Gemini ⇄ OpenAI
+- Supports thinking/reasoning mode conversion
 
 **Embedded Resources** - Frontend built as embedded filesystem (`//go:embed web/dist`) for single binary deployment.
 
@@ -124,12 +137,20 @@ web/src/
 
 ### Adding a New AI Provider
 
-1. Create adapter in `relay/channel/<provider>/adaptor.go`
-2. Implement request transformation (OpenAI format → Provider format)
-3. Implement response transformation (Provider format → OpenAI format)
-4. Handle streaming responses if supported
-5. Add provider constant in `constant/channel.go`
-6. Register adapter in relay routing logic
+1. Add channel type constant in `constant/channel.go`:
+   - Add `ChannelType<Provider>` constant with next available ID
+   - Add base URL to `ChannelBaseURLs` array
+   - Add name to `ChannelTypeNames` map
+
+2. Create adapter in `relay/channel/<provider>/adaptor.go`:
+   - Implement the `Adaptor` interface from `relay/channel/adapter.go`
+   - Key methods: `Init`, `GetRequestURL`, `SetupRequestHeader`, `ConvertOpenAIRequest`, `DoRequest`, `DoResponse`
+   - For async tasks (video, music), implement `TaskAdaptor` instead
+
+3. Register adapter in `relay/channel/adapter_selector.go` (or equivalent routing logic)
+
+4. Add provider-specific constants in `relay/channel/<provider>/constants.go`:
+   - Model lists, API versions, special configurations
 
 ### Adding a New API Endpoint
 

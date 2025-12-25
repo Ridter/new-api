@@ -92,7 +92,8 @@ func ProcessStreamResponse(streamResponse dto.ChatCompletionsStreamResponse, res
 	return nil
 }
 
-func processTokens(relayMode int, streamItems []string, responseTextBuilder *strings.Builder, toolCount *int) error {
+// ProcessTokens 处理流式响应的 token 计算
+func ProcessTokens(relayMode int, streamItems []string, responseTextBuilder *strings.Builder, toolCount *int) error {
 	streamResp := "[" + strings.Join(streamItems, ",") + "]"
 
 	switch relayMode {
@@ -166,10 +167,17 @@ func processCompletions(streamResp string, streamItems []string, responseTextBui
 	return nil
 }
 
-func handleLastResponse(lastStreamData string, responseId *string, createAt *int64,
+// HandleLastResponse 处理流式响应的最后一个数据块
+func HandleLastResponse(lastStreamData string, responseId *string, createAt *int64,
 	systemFingerprint *string, model *string, usage **dto.Usage,
 	containStreamUsage *bool, info *relaycommon.RelayInfo,
 	shouldSendLastResp *bool) error {
+
+	// 如果 lastStreamData 为空，直接返回，不记录错误
+	// 这通常发生在客户端提前断开连接的情况下
+	if lastStreamData == "" || lastStreamData == " " {
+		return nil
+	}
 
 	var lastStreamResponse dto.ChatCompletionsStreamResponse
 	if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &lastStreamResponse); err != nil {

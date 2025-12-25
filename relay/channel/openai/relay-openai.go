@@ -165,7 +165,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	// 处理最后的响应
 	shouldSendLastResp := true
-	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
+	if err := HandleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
 		&containStreamUsage, info, &shouldSendLastResp); err != nil {
 		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
 	}
@@ -180,7 +180,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	// 处理token计算
-	if err := processTokens(info.RelayMode, streamItems, &responseTextBuilder, &toolCount); err != nil {
+	if err := ProcessTokens(info.RelayMode, streamItems, &responseTextBuilder, &toolCount); err != nil {
 		logger.LogError(c, "error processing tokens: "+err.Error())
 	}
 
