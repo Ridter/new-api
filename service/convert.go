@@ -264,7 +264,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 	}
 
 	// First response: Send message_start
-	if info.SendResponseCount == 1 {
+	if info.SendResponseCount == 1 && !info.ClaudeConvertInfo.HasMessageStartSent {
 		msg := &dto.ClaudeMediaMessage{
 			Id:    openAIResponse.Id,
 			Model: openAIResponse.Model,
@@ -280,6 +280,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			Type:    "message_start",
 			Message: msg,
 		})
+		info.ClaudeConvertInfo.HasMessageStartSent = true
 
 		// Handle first response with tool calls
 		if openAIResponse.IsToolCall() {
@@ -358,6 +359,49 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 	// Handle no choices (empty response or done)
 	if len(openAIResponse.Choices) == 0 {
 		if info.ClaudeConvertInfo.Done {
+			// Ensure message_start is sent before any other events
+			// This handles edge cases where Done is set without prior message_start
+			if !info.ClaudeConvertInfo.HasMessageStartSent {
+				msg := &dto.ClaudeMediaMessage{
+					Id:    info.UpstreamModelName, // Use model name as fallback ID
+					Model: info.UpstreamModelName,
+					Type:  "message",
+					Role:  "assistant",
+					Usage: &dto.ClaudeUsage{
+						InputTokens:  info.GetEstimatePromptTokens(),
+						OutputTokens: 0,
+					},
+				}
+				msg.SetContent(make([]any, 0))
+				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+					Type:    "message_start",
+					Message: msg,
+				})
+				info.ClaudeConvertInfo.HasMessageStartSent = true
+			}
+
+			// If no content block was ever started, we need to send an empty text block
+			// to satisfy Claude API event sequence requirements:
+			// message_start → content_block_start → content_block_stop → message_delta → message_stop
+			if !info.ClaudeConvertInfo.HasContentBlockStarted {
+				// Send empty text content block
+				emptyBlockIndex := 0
+				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+					Index: &emptyBlockIndex,
+					Type:  "content_block_start",
+					ContentBlock: &dto.ClaudeMediaMessage{
+						Type: "text",
+						Text: common.GetPointer[string](""),
+					},
+				})
+				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+					Index: &emptyBlockIndex,
+					Type:  "content_block_stop",
+				})
+				info.ClaudeConvertInfo.HasContentBlockStarted = true
+				info.ClaudeConvertInfo.CurrentContentBlockIndex = -1 // Already closed
+			}
+
 			// Close any open content block
 			if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
 				// For thinking blocks, send signature_delta first if available
@@ -379,22 +423,30 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
 			}
 
-			// Send usage and stop
+			// Send usage and stop - message_delta is REQUIRED by Claude API
+			// even if usage is nil, we must send message_delta with stop_reason
 			oaiUsage := info.ClaudeConvertInfo.Usage
-			if oaiUsage != nil {
-				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-					Type: "message_delta",
-					Usage: &dto.ClaudeUsage{
-						InputTokens:              oaiUsage.PromptTokens,
-						OutputTokens:             oaiUsage.CompletionTokens,
-						CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
-						CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
-					},
-					Delta: &dto.ClaudeMediaMessage{
-						StopReason: common.GetPointer[string](stopReasonOpenAI2Claude(info.FinishReason)),
-					},
-				})
+			messageDelta := &dto.ClaudeResponse{
+				Type: "message_delta",
+				Delta: &dto.ClaudeMediaMessage{
+					StopReason: common.GetPointer[string](stopReasonOpenAI2Claude(info.FinishReason)),
+				},
 			}
+			if oaiUsage != nil {
+				messageDelta.Usage = &dto.ClaudeUsage{
+					InputTokens:              oaiUsage.PromptTokens,
+					OutputTokens:             oaiUsage.CompletionTokens,
+					CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
+					CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
+				}
+			} else {
+				// Provide default usage when not available
+				messageDelta.Usage = &dto.ClaudeUsage{
+					InputTokens:  info.GetEstimatePromptTokens(),
+					OutputTokens: 0,
+				}
+			}
+			claudeResponses = append(claudeResponses, messageDelta)
 			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 				Type: "message_stop",
 			})
@@ -415,15 +467,68 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 	// Note: When finish_reason is received, we should NOT return early if Done is false.
 	// Instead, we should continue processing any remaining content (like signature) in this response,
 	// and let HandleFinalResponse handle the final message_stop event.
-	if chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != "" {
+	hasFinishReason := chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != ""
+	if hasFinishReason {
 		info.FinishReason = *chosenChoice.FinishReason
-		// Don't return early here - continue processing to handle any content in this response
+	}
+
+	// Check if this is a finish-only response (has finish_reason but no actual content)
+	// In this case, we need to close any open content block now
+	isFinishOnlyResponse := hasFinishReason &&
+		chosenChoice.Delta.GetContentString() == "" &&
+		chosenChoice.Delta.GetReasoningContent() == "" &&
+		len(chosenChoice.Delta.ToolCalls) == 0
+
+	if isFinishOnlyResponse && info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+		// For thinking blocks, send signature_delta first if available
+		if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
+			info.ClaudeConvertInfo.ThinkingSignature != "" {
+			thinkingBlockIndex := info.ClaudeConvertInfo.CurrentContentBlockIndex
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: common.GetPointer[int](thinkingBlockIndex),
+				Type:  "content_block_delta",
+				Delta: &dto.ClaudeMediaMessage{
+					Type:      "signature_delta",
+					Signature: &info.ClaudeConvertInfo.ThinkingSignature,
+				},
+			})
+		}
+		// For tool blocks, close the last tool call block
+		if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeTools &&
+			info.ClaudeConvertInfo.LastToolCallIndex >= 0 {
+			prevBlockIndex := info.ClaudeConvertInfo.ToolCallIndexToContentIndex[info.ClaudeConvertInfo.LastToolCallIndex]
+			if stopBlock := generateStopBlock(prevBlockIndex, info); stopBlock != nil {
+				claudeResponses = append(claudeResponses, stopBlock)
+			}
+		} else {
+			if stopBlock := generateStopBlock(info.ClaudeConvertInfo.CurrentContentBlockIndex, info); stopBlock != nil {
+				claudeResponses = append(claudeResponses, stopBlock)
+			}
+		}
+		info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
 	}
 
 	// Handle done state
 	if info.ClaudeConvertInfo.Done {
-		// Close any open content block
-		if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+		// If no content block was ever started, we need to send an empty text block
+		// Claude API requires at least one content_block_start/stop pair before message_delta
+		if !info.ClaudeConvertInfo.HasContentBlockStarted {
+			// Send empty text content block
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: common.GetPointer[int](0),
+				Type:  "content_block_start",
+				ContentBlock: &dto.ClaudeMediaMessage{
+					Type: "text",
+					Text: common.GetPointer[string](""),
+				},
+			})
+			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
+				Index: common.GetPointer[int](0),
+				Type:  "content_block_stop",
+			})
+			info.ClaudeConvertInfo.HasContentBlockStarted = true
+		} else if info.ClaudeConvertInfo.CurrentContentBlockIndex >= 0 {
+			// Close any open content block
 			// For thinking blocks, send signature_delta first if available
 			if info.ClaudeConvertInfo.LastMessagesType == relaycommon.LastMessageTypeThinking &&
 				info.ClaudeConvertInfo.ThinkingSignature != "" {
@@ -452,21 +557,28 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			info.ClaudeConvertInfo.CurrentContentBlockIndex = -1
 		}
 
+		// Send usage and stop - message_delta is REQUIRED by Claude API
 		oaiUsage := info.ClaudeConvertInfo.Usage
-		if oaiUsage != nil {
-			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
-				Type: "message_delta",
-				Usage: &dto.ClaudeUsage{
-					InputTokens:              oaiUsage.PromptTokens,
-					OutputTokens:             oaiUsage.CompletionTokens,
-					CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
-					CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
-				},
-				Delta: &dto.ClaudeMediaMessage{
-					StopReason: common.GetPointer[string](stopReasonOpenAI2Claude(info.FinishReason)),
-				},
-			})
+		messageDelta := &dto.ClaudeResponse{
+			Type: "message_delta",
+			Delta: &dto.ClaudeMediaMessage{
+				StopReason: common.GetPointer[string](stopReasonOpenAI2Claude(info.FinishReason)),
+			},
 		}
+		if oaiUsage != nil {
+			messageDelta.Usage = &dto.ClaudeUsage{
+				InputTokens:              oaiUsage.PromptTokens,
+				OutputTokens:             oaiUsage.CompletionTokens,
+				CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,
+				CacheReadInputTokens:     oaiUsage.PromptTokensDetails.CachedTokens,
+			}
+		} else {
+			messageDelta.Usage = &dto.ClaudeUsage{
+				InputTokens:  info.GetEstimatePromptTokens(),
+				OutputTokens: 0,
+			}
+		}
+		claudeResponses = append(claudeResponses, messageDelta)
 		claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 			Type: "message_stop",
 		})

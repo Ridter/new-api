@@ -1,7 +1,6 @@
 package codebuddy
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -26,17 +24,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const SensitiveContentMessage = "系统检测到您当前输入的信息存在敏感内容"
-
 // 最大重试次数
 const MaxSensitiveRetries = 3
 
-// 检测敏感内容的最大字节数（只检测响应开头部分）
-const SensitiveCheckMaxBytes = 4096
-
-// 敏感内容检测的最大累积内容长度（字符数）
-// 敏感消息通常很短，超过这个长度就不再检测
-const SensitiveCheckMaxContentLength = 200
+// FinishReasonContentFilter 内容过滤的 finish_reason 标志
+// 当上游返回此标志时，表示触发了敏感内容过滤
+const FinishReasonContentFilter = "content_filter"
 
 // ErrSensitiveContent 敏感内容错误
 var ErrSensitiveContent = errors.New("sensitive content detected")
@@ -191,54 +184,14 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	default:
 	}
 
-	// 使用流式检测：先预读取前 N 个字节来快速检测敏感内容
-	// 如果敏感消息在开头，可以快速检测到
-	peekReader := bufio.NewReaderSize(resp.Body, SensitiveCheckMaxBytes)
-	peekedData, peekErr := peekReader.Peek(SensitiveCheckMaxBytes)
-
-	// Peek 可能返回 EOF 或其他错误，但只要有数据就继续处理
-	if peekErr != nil && peekErr != io.EOF && peekErr != bufio.ErrBufferFull {
-		// 检查是否是客户端断开
-		select {
-		case <-c.Request.Context().Done():
-			resp.Body.Close()
-			return nil, nil
-		default:
-		}
-		// 如果没有读取到任何数据，返回错误
-		if len(peekedData) == 0 {
-			resp.Body.Close()
-			return nil, types.NewOpenAIError(peekErr, types.ErrorCodeBadResponse, http.StatusInternalServerError)
-		}
-	}
-
-	// 检查预读取的数据是否包含敏感内容（快速路径）
-	if strings.Contains(string(peekedData), SensitiveContentMessage) {
-		resp.Body.Close()
-		return a.handleSensitiveRetry(c, info, string(peekedData))
-	}
-
-	// 检查客户端状态
-	select {
-	case <-c.Request.Context().Done():
-		resp.Body.Close()
-		return nil, nil
-	default:
-	}
-
-	// peekReader 内部已经缓冲了数据，直接用它作为新的 Body
-	resp.Body = &wrappedReadCloser{
-		Reader: peekReader,
-		Closer: resp.Body,
-	}
-
-	// 使用自定义流处理器，在流式传输过程中检测敏感内容
-	return a.streamWithSensitiveDetection(c, resp, info)
+	// 非阻塞流式处理：只检测第一个数据块的 finish_reason
+	return a.streamWithContentFilterDetection(c, resp, info)
 }
 
-// streamWithSensitiveDetection 流式处理响应，同时检测敏感内容
-// 策略：先缓冲前 N 个字符的内容进行检测，检测通过后再一次性发送缓冲数据并继续流式传输
-func (a *Adaptor) streamWithSensitiveDetection(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
+// streamWithContentFilterDetection 非阻塞流式处理
+// 策略：只检测第一个数据块的 finish_reason 是否为 "content_filter"
+// 如果是，立即重试；否则直接透传所有数据，零延迟
+func (a *Adaptor) streamWithContentFilterDetection(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
 	model := info.UpstreamModelName
@@ -252,25 +205,17 @@ func (a *Adaptor) streamWithSensitiveDetection(c *gin.Context, resp *http.Respon
 	var streamItems []string
 	var lastStreamData string
 
-	// 敏感内容检测相关
-	var contentBuilder strings.Builder
-	var sensitiveDetected bool
+	// 第一个数据块检测标志
+	var firstChunkProcessed bool
+	var contentFilterDetected bool
 	var detectedContent string
-	var mu sync.Mutex
 
-	// 缓冲相关：在检测阶段缓冲数据，检测通过后再发送
-	var bufferedItems []string
-	var detectionPassed bool // 检测是否已通过（累积内容超过阈值且未检测到敏感内容）
-
-	// 设置 SSE 响应头（延迟到确认安全后再设置）
+	// 设置 SSE 响应头标志
 	var headersSet bool
 
 	helper.StreamScannerHandler(c, resp, info, func(data string) bool {
-		mu.Lock()
-		defer mu.Unlock()
-
-		// 如果已经检测到敏感内容，停止处理
-		if sensitiveDetected {
+		// 如果已经检测到 content_filter，停止处理
+		if contentFilterDetected {
 			return false
 		}
 
@@ -278,59 +223,37 @@ func (a *Adaptor) streamWithSensitiveDetection(c *gin.Context, resp *http.Respon
 			streamItems = append(streamItems, data)
 		}
 
-		// 检测阶段：累积内容并检测
-		if !detectionPassed {
-			// 解析流数据，提取内容用于敏感检测
+		// 只检测第一个数据块
+		if !firstChunkProcessed {
+			firstChunkProcessed = true
+
+			// 解析第一个数据块，检测 finish_reason
 			var streamResp dto.ChatCompletionsStreamResponse
 			if err := common.Unmarshal(common.StringToByteSlice(data), &streamResp); err == nil {
 				for _, choice := range streamResp.Choices {
-					content := choice.Delta.GetContentString()
-					if content != "" {
-						contentBuilder.WriteString(content)
+					// 检测 content_filter
+					if choice.FinishReason != nil && *choice.FinishReason == FinishReasonContentFilter {
+						contentFilterDetected = true
+						detectedContent = choice.Delta.GetContentString()
+						return false // 停止处理，准备重试
 					}
 				}
 			}
 
-			// 检测累积的内容是否包含敏感词
-			if strings.Contains(contentBuilder.String(), SensitiveContentMessage) {
-				sensitiveDetected = true
-				detectedContent = contentBuilder.String()
-				return false // 停止处理，准备重试
+			// 第一个块没有 content_filter，设置响应头并开始流式传输
+			if !headersSet {
+				helper.SetEventStreamHeaders(c)
+				headersSet = true
 			}
 
-			// 缓冲当前数据
+			// 保存第一个数据块，等待下一个块到来时发送
 			if len(data) > 0 {
-				bufferedItems = append(bufferedItems, data)
-			}
-
-			// 检查是否超过检测阈值
-			if contentBuilder.Len() >= SensitiveCheckMaxContentLength {
-				// 检测通过，发送所有缓冲的数据
-				detectionPassed = true
-
-				// 现在才设置 SSE 响应头
-				if !headersSet {
-					helper.SetEventStreamHeaders(c)
-					headersSet = true
-				}
-
-				// 发送所有缓冲的数据（除了最后一条，保持 lastStreamData 逻辑）
-				for i, item := range bufferedItems {
-					if i < len(bufferedItems)-1 {
-						err := openai.HandleStreamFormat(c, info, item, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
-						if err != nil {
-							common.SysLog("error handling stream format: " + err.Error())
-						}
-					} else {
-						lastStreamData = item
-					}
-				}
-				bufferedItems = nil // 清空缓冲
+				lastStreamData = data
 			}
 			return true
 		}
 
-		// 检测已通过，正常流式传输
+		// 后续数据块：直接透传，零延迟
 		if lastStreamData != "" {
 			err := openai.HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 			if err != nil {
@@ -344,30 +267,10 @@ func (a *Adaptor) streamWithSensitiveDetection(c *gin.Context, resp *http.Respon
 		return true
 	})
 
-	// 检查是否检测到敏感内容
-	if sensitiveDetected {
-		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 流式检测到敏感内容: %s", detectedContent))
+	// 检查是否检测到 content_filter
+	if contentFilterDetected {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 检测到 content_filter，内容: %s", detectedContent))
 		return a.handleSensitiveRetry(c, info, detectedContent)
-	}
-
-	// 如果响应很短（未达到检测阈值就结束了），需要发送缓冲的数据
-	if !detectionPassed && len(bufferedItems) > 0 {
-		// 检测通过（响应结束且未检测到敏感内容）
-		if !headersSet {
-			helper.SetEventStreamHeaders(c)
-		}
-
-		// 发送所有缓冲的数据（除了最后一条）
-		for i, item := range bufferedItems {
-			if i < len(bufferedItems)-1 {
-				err := openai.HandleStreamFormat(c, info, item, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
-				if err != nil {
-					common.SysLog("error handling stream format: " + err.Error())
-				}
-			} else {
-				lastStreamData = item
-			}
-		}
 	}
 
 	// 处理最后的响应
@@ -451,12 +354,6 @@ func (a *Adaptor) handleSensitiveRetry(c *gin.Context, info *relaycommon.RelayIn
 		types.ErrorCodeSensitiveWordsDetected,
 		http.StatusBadGateway,
 	)
-}
-
-// wrappedReadCloser 包装 Reader 和 Closer
-type wrappedReadCloser struct {
-	io.Reader
-	io.Closer
 }
 
 func (a *Adaptor) GetModelList() []string {

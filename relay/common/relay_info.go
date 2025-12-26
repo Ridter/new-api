@@ -44,6 +44,7 @@ type ClaudeConvertInfo struct {
 	ThinkingSignature           string      // Store thinking block signature for signature_delta
 	LastToolCallIndex           int         // Track last tool call index for proper block closing
 	HasContentBlockStarted      bool        // Track if any content_block_start has been sent (to prevent orphan stop blocks)
+	HasMessageStartSent         bool        // Track if message_start event has been sent
 }
 
 type RerankerInfo struct {
