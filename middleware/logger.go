@@ -24,6 +24,6 @@ func SetUpLogger(server *gin.Engine) {
 				param.Path,
 			)
 		},
-		SkipPaths: []string{"/api/event_logging/batch"},
+		SkipPaths: []string{"/api/event_logging/batch", "/chat/completions"},
 	}))
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -25,7 +26,7 @@ import (
 )
 
 // 最大重试次数
-const MaxSensitiveRetries = 3
+const MaxSensitiveRetries = 10
 
 // FinishReasonContentFilter 内容过滤的 finish_reason 标志
 // 当上游返回此标志时，表示触发了敏感内容过滤
@@ -180,7 +181,8 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	select {
 	case <-c.Request.Context().Done():
 		resp.Body.Close()
-		return nil, nil
+		// 返回空的 Usage 而不是 nil，避免 claude_handler.go 中的类型断言 panic
+		return &dto.Usage{}, nil
 	default:
 	}
 
@@ -330,16 +332,34 @@ func (a *Adaptor) handleSensitiveRetry(c *gin.Context, info *relaycommon.RelayIn
 		c.Set("codebuddy_sensitive_retry", retryCount+1)
 		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 检测到敏感内容，正在重试 (%d/%d)", retryCount+1, MaxSensitiveRetries))
 
-		// 获取原始请求体并重新发起请求
-		requestBody, bodyErr := common.GetRequestBody(c)
-		if bodyErr != nil {
-			return &dto.Usage{}, types.NewOpenAIError(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest)
+		// 每次重试都尝试切换到不同的 API Key
+		if err := a.switchToNextKey(c, info); err != nil {
+			logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 切换 Key 失败: %v，继续使用当前 Key", err))
+		}
+
+		// 优先使用保存的上游请求体（转换后的 OpenAI 格式）
+		// 这是关键：必须使用转换后的格式，而不是原始的 Claude 格式
+		var requestBody []byte
+		if cached, exists := c.Get(KeyCodeBuddyUpstreamRequest); exists && cached != nil {
+			if b, ok := cached.([]byte); ok {
+				requestBody = b
+				logger.LogInfo(c, "[CodeBuddy] 使用缓存的上游请求体进行重试")
+			}
+		}
+		// 如果没有缓存，回退到原始请求体（这种情况不应该发生）
+		if requestBody == nil {
+			var bodyErr error
+			requestBody, bodyErr = common.GetRequestBody(c)
+			if bodyErr != nil {
+				return &dto.Usage{}, types.NewOpenAIError(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest)
+			}
+			logger.LogWarn(c, "[CodeBuddy] 警告：未找到缓存的上游请求体，使用原始请求体")
 		}
 
 		// 重新发起请求
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
-		newResp, doErr := a.DoRequest(c, info, bytes.NewBuffer(requestBody))
+		newResp, doErr := a.DoRequest(c, info, bytes.NewReader(requestBody))
 		if doErr != nil {
+			logger.LogError(c, fmt.Sprintf("[CodeBuddy] 重试请求失败: %v", doErr))
 			return &dto.Usage{}, types.NewOpenAIError(doErr, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 		}
 
@@ -349,6 +369,82 @@ func (a *Adaptor) handleSensitiveRetry(c *gin.Context, info *relaycommon.RelayIn
 
 	// 超过最大重试次数，返回错误
 	logger.LogError(c, fmt.Sprintf("[CodeBuddy] 检测重试次数已达上限 (%d次)", MaxSensitiveRetries))
+
+	// 对于 Claude 格式的请求，需要发送符合 Claude API 规范的完整事件序列
+	// Claude API 要求: message_start → content_block_start → content_block_delta → content_block_stop → message_delta → message_stop
+	// 只发送 error 事件会导致客户端因收到不完整的 SSE 流而断开连接
+	if info.RelayFormat == types.RelayFormatClaude {
+		// 确保 SSE 头部已设置
+		helper.SetEventStreamHeaders(c)
+
+		errorMessage := fmt.Sprintf("Sorry, the upstream service detected sensitive content. Request failed after %d retries. Please modify your question and try again.", MaxSensitiveRetries)
+		blockIndex := 0
+
+		// 1. message_start - 开始消息
+		msgStart := &dto.ClaudeResponse{
+			Type: "message_start",
+			Message: &dto.ClaudeMediaMessage{
+				Id:    fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+				Model: info.UpstreamModelName,
+				Type:  "message",
+				Role:  "assistant",
+				Usage: &dto.ClaudeUsage{
+					InputTokens:  info.GetEstimatePromptTokens(),
+					OutputTokens: 0,
+				},
+			},
+		}
+		msgStart.Message.SetContent(make([]any, 0))
+		_ = helper.ClaudeData(c, *msgStart)
+
+		// 2. content_block_start - 开始内容块
+		blockStart := &dto.ClaudeResponse{
+			Index: &blockIndex,
+			Type:  "content_block_start",
+			ContentBlock: &dto.ClaudeMediaMessage{
+				Type: "text",
+				Text: common.GetPointer[string](""),
+			},
+		}
+		_ = helper.ClaudeData(c, *blockStart)
+
+		// 3. content_block_delta - 发送错误消息内容
+		blockDelta := &dto.ClaudeResponse{
+			Index: &blockIndex,
+			Type:  "content_block_delta",
+			Delta: &dto.ClaudeMediaMessage{
+				Type: "text_delta",
+				Text: common.GetPointer[string](errorMessage),
+			},
+		}
+		_ = helper.ClaudeData(c, *blockDelta)
+
+		// 4. content_block_stop - 结束内容块
+		blockStop := &dto.ClaudeResponse{
+			Index: &blockIndex,
+			Type:  "content_block_stop",
+		}
+		_ = helper.ClaudeData(c, *blockStop)
+
+		// 5. message_delta - 消息结束原因
+		msgDelta := &dto.ClaudeResponse{
+			Type: "message_delta",
+			Delta: &dto.ClaudeMediaMessage{
+				StopReason: common.GetPointer[string]("end_turn"),
+			},
+			Usage: &dto.ClaudeUsage{
+				OutputTokens: 0,
+			},
+		}
+		_ = helper.ClaudeData(c, *msgDelta)
+
+		// 6. message_stop - 消息结束
+		msgStop := &dto.ClaudeResponse{
+			Type: "message_stop",
+		}
+		_ = helper.ClaudeData(c, *msgStop)
+	}
+
 	return &dto.Usage{}, types.NewOpenAIError(
 		fmt.Errorf("upstream sensitive content filter triggered after %d retries", MaxSensitiveRetries),
 		types.ErrorCodeSensitiveWordsDetected,
@@ -362,4 +458,33 @@ func (a *Adaptor) GetModelList() []string {
 
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
+}
+
+// switchToNextKey 切换到下一个可用的 API Key
+// 用于敏感内容重试时尝试使用不同的 Key
+func (a *Adaptor) switchToNextKey(c *gin.Context, info *relaycommon.RelayInfo) error {
+	// 获取渠道信息
+	channel, err := model.CacheGetChannel(info.ChannelId)
+	if err != nil {
+		return fmt.Errorf("获取渠道信息失败: %w", err)
+	}
+
+	// 获取下一个可用的 Key
+	newKey, newIndex, keyErr := channel.GetNextEnabledKey()
+	if keyErr != nil {
+		return fmt.Errorf("获取下一个 Key 失败: %w", keyErr)
+	}
+
+	// 检查是否与当前 Key 相同（避免无效切换）
+	if newKey == info.ApiKey {
+		return errors.New("没有其他可用的 Key")
+	}
+
+	// 更新 info 中的 Key 信息
+	oldIndex := info.ChannelMultiKeyIndex
+	info.ApiKey = newKey
+	info.ChannelMultiKeyIndex = newIndex
+
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 已切换 API Key: index %d -> %d", oldIndex, newIndex))
+	return nil
 }
