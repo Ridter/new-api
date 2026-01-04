@@ -178,7 +178,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		Retry:      common.GetPointer(0),
 	}
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	// 渠道切换重试次数（当遇到 channel error 时额外允许的重试次数）
+	// 这是独立于 RetryTimes 的，确保即使 RetryTimes=0 也能进行渠道切换
+	const maxChannelSwitchRetries = 5
+	channelSwitchRetries := 0
+
+	for ; retryParam.GetRetry() <= common.RetryTimes || channelSwitchRetries > 0; retryParam.IncreaseRetry() {
+		// 如果是渠道切换重试，减少计数
+		if retryParam.GetRetry() > common.RetryTimes && channelSwitchRetries > 0 {
+			channelSwitchRetries--
+		}
+
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
@@ -218,6 +228,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
+		}
+
+		// 如果是 channel error 且 RetryTimes=0，允许额外的渠道切换重试
+		if types.IsChannelError(newAPIError) && common.RetryTimes == 0 && channelSwitchRetries == 0 {
+			channelSwitchRetries = maxChannelSwitchRetries
+			logger.LogInfo(c, fmt.Sprintf("检测到渠道错误，允许额外 %d 次渠道切换重试", maxChannelSwitchRetries))
 		}
 	}
 

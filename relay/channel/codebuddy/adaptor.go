@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,6 +28,9 @@ import (
 
 // 最大重试次数
 const MaxSensitiveRetries = 10
+
+// MaxRateLimitRetries 429 限流最大重试次数
+const MaxRateLimitRetries = 5
 
 // FinishReasonContentFilter 内容过滤的 finish_reason 标志
 // 当上游返回此标志时，表示触发了敏感内容过滤
@@ -159,6 +163,9 @@ func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayIn
 // KeyCodeBuddyUpstreamRequest 用于存储发送给上游的请求体（仅在敏感内容检测时使用）
 const KeyCodeBuddyUpstreamRequest = "codebuddy_upstream_request"
 
+// RateLimitResetTimeKey 用于存储从响应中解析的冷却重置时间
+const RateLimitResetTimeKey = "codebuddy_ratelimit_reset_time"
+
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
 	// 读取请求体
 	bodyBytes, err := io.ReadAll(requestBody)
@@ -169,7 +176,26 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	// 保存请求体到 context，仅用于敏感内容检测时记录完整的上游请求
 	c.Set(KeyCodeBuddyUpstreamRequest, bodyBytes)
 
-	return channel.DoApiRequest(a, c, info, bytes.NewReader(bodyBytes))
+	// 发起请求并处理 429 限流
+	return a.doRequestWithRateLimitRetry(c, info, bodyBytes)
+}
+
+// doRequestWithRateLimitRetry 发起请求，并在遇到 429 限流时自动切换 Key 重试
+func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte) (any, error) {
+	resp, err := channel.DoApiRequest(a, c, info, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] DoRequest 响应状态码: %d", resp.StatusCode))
+
+	// 检查是否是 429 限流响应
+	if resp.StatusCode == http.StatusTooManyRequests {
+		logger.LogInfo(c, "[CodeBuddy] 检测到 429 限流，开始处理...")
+		return a.handleRateLimitInRequest(c, info, bodyBytes, resp)
+	}
+
+	return resp, nil
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
@@ -186,6 +212,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	default:
 	}
 
+	// 429 限流已在 DoRequest 阶段处理，这里直接进行流式处理
 	// 非阻塞流式处理：只检测第一个数据块的 finish_reason
 	return a.streamWithContentFilterDetection(c, resp, info)
 }
@@ -458,6 +485,190 @@ func (a *Adaptor) GetModelList() []string {
 
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
+}
+
+// parseRateLimitResetTime 从错误信息中解析冷却重置时间
+// 示例: "usage will reset at 2026-01-04 12:19:47 UTC+8"
+func parseRateLimitResetTime(errorBody string) *time.Time {
+	// 匹配时间格式: 2026-01-04 12:19:47 UTC+8
+	re := regexp.MustCompile(`reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (UTC[+-]\d+)`)
+	matches := re.FindStringSubmatch(errorBody)
+	if len(matches) < 3 {
+		return nil
+	}
+
+	dateTimeStr := matches[1]
+	tzStr := matches[2]
+
+	// 解析时区偏移
+	var tzOffset int
+	if strings.HasPrefix(tzStr, "UTC+") {
+		fmt.Sscanf(tzStr, "UTC+%d", &tzOffset)
+	} else if strings.HasPrefix(tzStr, "UTC-") {
+		fmt.Sscanf(tzStr, "UTC-%d", &tzOffset)
+		tzOffset = -tzOffset
+	}
+
+	// 创建固定偏移时区
+	loc := time.FixedZone(tzStr, tzOffset*3600)
+
+	// 解析时间
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", dateTimeStr, loc)
+	if err != nil {
+		return nil
+	}
+
+	return &t
+}
+
+// handleRateLimitInRequest 在 DoRequest 阶段处理 429 限流，切换 Key 并重试
+func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte, resp *http.Response) (any, error) {
+	// 读取错误响应体
+	var errorBody string
+	if resp.Body != nil {
+		respBytes, _ := io.ReadAll(resp.Body)
+		errorBody = string(respBytes)
+		resp.Body.Close()
+	}
+
+	// 获取当前重试次数
+	retryCount := c.GetInt("codebuddy_ratelimit_retry")
+
+	// 解析冷却重置时间
+	resetTime := parseRateLimitResetTime(errorBody)
+	var cooldownDuration time.Duration
+	if resetTime != nil {
+		cooldownDuration = time.Until(*resetTime)
+		if cooldownDuration < 0 {
+			cooldownDuration = 0
+		}
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流，Key index: %d 冷却至 %s (还需 %v)",
+			info.ChannelMultiKeyIndex, resetTime.Format("2006-01-02 15:04:05"), cooldownDuration))
+
+		// 设置当前 Key 的冷却时间
+		a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, *resetTime)
+	} else {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流，Key index: %d，无法解析冷却时间，错误信息: %s",
+			info.ChannelMultiKeyIndex, errorBody))
+	}
+
+	// 检查是否还有重试次数
+	if retryCount >= MaxRateLimitRetries {
+		logger.LogError(c, fmt.Sprintf("[CodeBuddy] 429 限流重试次数已达上限 (%d次)，触发渠道切换", MaxRateLimitRetries))
+		// 返回 channel error，触发上层切换渠道
+		return nil, types.NewError(
+			fmt.Errorf("all keys rate limited: %s", errorBody),
+			types.ErrorCodeChannelAllKeysRateLimited,
+		)
+	}
+
+	// 增加重试计数
+	c.Set("codebuddy_ratelimit_retry", retryCount+1)
+
+	// 尝试切换到下一个 Key（跳过冷却中的 Key）
+	if err := a.switchToNextAvailableKey(c, info); err != nil {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 切换 Key 失败: %v，触发渠道切换", err))
+		// 没有其他可用 Key，返回 channel error 触发上层切换渠道
+		return nil, types.NewError(
+			fmt.Errorf("all keys in cooldown: %s", errorBody),
+			types.ErrorCodeChannelAllKeysRateLimited,
+		)
+	}
+
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 429 限流，已切换到新 Key (index: %d)，正在重试 (%d/%d)",
+		info.ChannelMultiKeyIndex, retryCount+1, MaxRateLimitRetries))
+
+	// 递归重试请求
+	return a.doRequestWithRateLimitRetry(c, info, bodyBytes)
+}
+
+// createErrorResponse 创建一个模拟的错误响应，用于返回给上层
+func createErrorResponse(statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+	}
+}
+
+// setKeyCooldown 设置指定 Key 的冷却时间
+func (a *Adaptor) setKeyCooldown(channelId int, keyIndex int, resetTime time.Time) {
+	ch, err := model.CacheGetChannel(channelId)
+	if err != nil {
+		return
+	}
+
+	// 获取渠道轮询锁
+	lock := model.GetChannelPollingLock(channelId)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// 初始化冷却时间 map
+	if ch.ChannelInfo.MultiKeyCooldownUntil == nil {
+		ch.ChannelInfo.MultiKeyCooldownUntil = make(map[int]int64)
+	}
+
+	// 设置冷却结束时间（Unix 时间戳）
+	ch.ChannelInfo.MultiKeyCooldownUntil[keyIndex] = resetTime.Unix()
+}
+
+// switchToNextAvailableKey 切换到下一个可用的 Key（跳过冷却中的 Key）
+func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.RelayInfo) error {
+	ch, err := model.CacheGetChannel(info.ChannelId)
+	if err != nil {
+		return fmt.Errorf("获取渠道信息失败: %w", err)
+	}
+
+	// 获取所有 Key
+	keys := ch.GetKeys()
+	if len(keys) <= 1 {
+		return errors.New("没有其他可用的 Key")
+	}
+
+	// 获取渠道轮询锁
+	lock := model.GetChannelPollingLock(info.ChannelId)
+	lock.Lock()
+	defer lock.Unlock()
+
+	now := time.Now().Unix()
+	currentIndex := info.ChannelMultiKeyIndex
+
+	// 查找下一个不在冷却中的 Key
+	for i := 1; i < len(keys); i++ {
+		nextIndex := (currentIndex + i) % len(keys)
+
+		// 检查 Key 是否被禁用
+		if ch.ChannelInfo.MultiKeyStatusList != nil {
+			if status, ok := ch.ChannelInfo.MultiKeyStatusList[nextIndex]; ok {
+				if status != common.ChannelStatusEnabled {
+					continue
+				}
+			}
+		}
+
+		// 检查 Key 是否在冷却中
+		if ch.ChannelInfo.MultiKeyCooldownUntil != nil {
+			if cooldownUntil, ok := ch.ChannelInfo.MultiKeyCooldownUntil[nextIndex]; ok {
+				if cooldownUntil > now {
+					// 仍在冷却中
+					logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 仍在冷却中，跳过", nextIndex))
+					continue
+				}
+			}
+		}
+
+		// 找到可用的 Key
+		info.ApiKey = keys[nextIndex]
+		info.ChannelMultiKeyIndex = nextIndex
+
+		// 更新轮询索引
+		ch.ChannelInfo.MultiKeyPollingIndex = (nextIndex + 1) % len(keys)
+
+		logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 已切换 API Key: index %d -> %d", currentIndex, nextIndex))
+		return nil
+	}
+
+	return errors.New("所有 Key 都在冷却中或被禁用")
 }
 
 // switchToNextKey 切换到下一个可用的 API Key
