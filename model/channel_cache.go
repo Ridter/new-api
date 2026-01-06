@@ -93,6 +93,63 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
+// hasAvailableKey checks if a channel has at least one key that is not in cooldown
+// 检查渠道是否有至少一个不在冷却中的 key
+func hasAvailableKey(channel *Channel) bool {
+	// If not in multi-key mode, always return true
+	// 如果不是多 key 模式，始终返回 true
+	if !channel.ChannelInfo.IsMultiKey {
+		return true
+	}
+
+	// If no cooldown map, all keys are available
+	// 如果没有冷却时间映射，所有 key 都可用
+	if channel.ChannelInfo.MultiKeyCooldownUntil == nil || len(channel.ChannelInfo.MultiKeyCooldownUntil) == 0 {
+		return true
+	}
+
+	keys := channel.GetKeys()
+	if len(keys) == 0 {
+		return false
+	}
+
+	now := time.Now().Unix()
+	statusList := channel.ChannelInfo.MultiKeyStatusList
+
+	// Check if at least one key is enabled and not in cooldown
+	// 检查是否至少有一个 key 是启用的且不在冷却中
+	for i := range keys {
+		// Check if key is enabled
+		// 检查 key 是否启用
+		keyEnabled := true
+		if statusList != nil {
+			if status, ok := statusList[i]; ok {
+				keyEnabled = status == common.ChannelStatusEnabled
+			}
+		}
+
+		if !keyEnabled {
+			continue
+		}
+
+		// Check if key is in cooldown
+		// 检查 key 是否在冷却中
+		if cooldownUntil, ok := channel.ChannelInfo.MultiKeyCooldownUntil[i]; ok {
+			if cooldownUntil > now {
+				// Key is still in cooldown
+				// Key 仍在冷却中
+				continue
+			}
+		}
+
+		// Found an available key
+		// 找到一个可用的 key
+		return true
+	}
+
+	return false
+}
+
 func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
@@ -114,6 +171,27 @@ func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel,
 	if len(channels) == 0 {
 		return nil, nil
 	}
+
+	// Filter out channels where all keys are in cooldown
+	// 过滤掉所有 key 都在冷却中的渠道
+	var availableChannels []int
+	for _, channelId := range channels {
+		if channel, ok := channelsIDM[channelId]; ok {
+			if hasAvailableKey(channel) {
+				availableChannels = append(availableChannels, channelId)
+			}
+		}
+	}
+
+	// If no channels with available keys, return nil to trigger channel switch
+	// 如果没有可用 key 的渠道，返回 nil 以触发渠道切换
+	if len(availableChannels) == 0 {
+		return nil, nil
+	}
+
+	// Use filtered channels for selection
+	// 使用过滤后的渠道进行选择
+	channels = availableChannels
 
 	if len(channels) == 1 {
 		if channel, ok := channelsIDM[channels[0]]; ok {
