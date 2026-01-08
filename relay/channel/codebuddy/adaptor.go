@@ -531,6 +531,16 @@ func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.Rel
 		resp.Body.Close()
 	}
 
+	// 检查是否是模型不可用的错误（code: 14003 等），而不是真正的限流
+	// 这种情况不应该重试，直接返回错误让上层切换渠道
+	if strings.Contains(errorBody, `"code":14003`) || strings.Contains(errorBody, `"code": 14003`) {
+		logger.LogError(c, fmt.Sprintf("[CodeBuddy] 模型不可用或服务错误，触发渠道切换，错误信息: %s", errorBody))
+		return nil, types.NewError(
+			fmt.Errorf("model unavailable: %s", errorBody),
+			types.ErrorCodeBadResponse,
+		)
+	}
+
 	// 获取当前重试次数
 	retryCount := c.GetInt("codebuddy_ratelimit_retry")
 
@@ -548,8 +558,11 @@ func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.Rel
 		// 设置当前 Key 的冷却时间
 		a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, *resetTime)
 	} else {
-		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流，Key index: %d，无法解析冷却时间，错误信息: %s",
+		// 无法解析冷却时间，设置默认冷却时间（1小时）
+		defaultCooldown := time.Now().Add(1 * time.Hour)
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流，Key index: %d，无法解析冷却时间，设置默认冷却1小时，错误信息: %s",
 			info.ChannelMultiKeyIndex, errorBody))
+		a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, defaultCooldown)
 	}
 
 	// 检查是否还有重试次数
