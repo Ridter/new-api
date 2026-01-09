@@ -730,6 +730,8 @@
     "密钥已启用": "Key has been enabled",
     "密钥已复制到剪贴板": "Key copied to clipboard",
     "密钥已禁用": "Key has been disabled",
+    "密钥测试成功": "Key test successful",
+    "测试密钥失败": "Key test failed",
     "密钥文件 (.json)": "Key file (.json)",
     "密钥更新模式": "Key update mode",
     "密钥格式": "Key format",

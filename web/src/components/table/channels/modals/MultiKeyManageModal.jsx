@@ -273,6 +273,32 @@ const MultiKeyManageModal = ({ visible, onCancel, channel, onRefresh }) => {
     }
   };
 
+  // Test a specific key
+  const handleTestKey = async (keyIndex) => {
+    const operationId = `test_${keyIndex}`;
+    setOperationLoading((prev) => ({ ...prev, [operationId]: true }));
+
+    try {
+      const res = await API.post('/api/channel/multi_key/manage', {
+        channel_id: channel.id,
+        action: 'test_key',
+        key_index: keyIndex,
+      });
+
+      if (res.data.success) {
+        const time = res.data.time ? ` (${res.data.time.toFixed(2)}s)` : '';
+        showSuccess(t('密钥测试成功') + time);
+      } else {
+        const time = res.data.time ? ` (${res.data.time.toFixed(2)}s)` : '';
+        showError(res.data.message + time);
+      }
+    } catch (error) {
+      showError(t('测试密钥失败'));
+    } finally {
+      setOperationLoading((prev) => ({ ...prev, [operationId]: false }));
+    }
+  };
+
   // Handle page change
   const handlePageChange = (page) => {
     setCurrentPage(page);
@@ -410,9 +436,17 @@ const MultiKeyManageModal = ({ visible, onCancel, channel, onRefresh }) => {
       title: t('操作'),
       key: 'action',
       fixed: 'right',
-      width: 150,
+      width: 200,
       render: (_, record) => (
         <Space>
+          <Button
+            type='tertiary'
+            size='small'
+            loading={operationLoading[`test_${record.index}`]}
+            onClick={() => handleTestKey(record.index)}
+          >
+            {t('测试')}
+          </Button>
           {record.status === 1 ? (
             <Button
               type='danger'

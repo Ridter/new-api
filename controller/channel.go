@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -1154,11 +1155,12 @@ func CopyChannel(c *gin.Context) {
 // MultiKeyManageRequest represents the request for multi-key management operations
 type MultiKeyManageRequest struct {
 	ChannelId int    `json:"channel_id"`
-	Action    string `json:"action"`              // "disable_key", "enable_key", "delete_key", "delete_disabled_keys", "get_key_status"
-	KeyIndex  *int   `json:"key_index,omitempty"` // for disable_key, enable_key, and delete_key actions
-	Page      int    `json:"page,omitempty"`      // for get_key_status pagination
-	PageSize  int    `json:"page_size,omitempty"` // for get_key_status pagination
-	Status    *int   `json:"status,omitempty"`    // for get_key_status filtering: 1=enabled, 2=manual_disabled, 3=auto_disabled, nil=all
+	Action    string `json:"action"`               // "disable_key", "enable_key", "delete_key", "delete_disabled_keys", "get_key_status", "test_key"
+	KeyIndex  *int   `json:"key_index,omitempty"`  // for disable_key, enable_key, delete_key, and test_key actions
+	Page      int    `json:"page,omitempty"`       // for get_key_status pagination
+	PageSize  int    `json:"page_size,omitempty"`  // for get_key_status pagination
+	Status    *int   `json:"status,omitempty"`     // for get_key_status filtering: 1=enabled, 2=manual_disabled, 3=auto_disabled, nil=all
+	TestModel string `json:"test_model,omitempty"` // for test_key action, optional model to test with
 }
 
 // MultiKeyStatusResponse represents the response for key status query
@@ -1629,6 +1631,61 @@ func ManageMultiKeys(c *gin.Context) {
 			"success": true,
 			"message": fmt.Sprintf("已删除 %d 个自动禁用的密钥", deletedCount),
 			"data":    deletedCount,
+		})
+		return
+
+	case "test_key":
+		if request.KeyIndex == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "未指定要测试的密钥索引",
+			})
+			return
+		}
+
+		keyIndex := *request.KeyIndex
+		if keyIndex < 0 || keyIndex >= channel.ChannelInfo.MultiKeySize {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "密钥索引超出范围",
+			})
+			return
+		}
+
+		keys := channel.GetKeys()
+		if keyIndex >= len(keys) {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "密钥索引超出范围",
+			})
+			return
+		}
+
+		// Create a temporary channel copy with only the specified key
+		tempChannel := *channel
+		tempChannel.Key = keys[keyIndex]
+		tempChannel.ChannelInfo.IsMultiKey = false
+		tempChannel.ChannelInfo.MultiKeySize = 0
+
+		tik := time.Now()
+		result := testChannel(&tempChannel, request.TestModel, "")
+		tok := time.Now()
+		milliseconds := tok.Sub(tik).Milliseconds()
+		consumedTime := float64(milliseconds) / 1000.0
+
+		if result.localErr != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": result.localErr.Error(),
+				"time":    consumedTime,
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": fmt.Sprintf("密钥 #%d 测试成功", keyIndex),
+			"time":    consumedTime,
 		})
 		return
 

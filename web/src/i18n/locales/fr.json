@@ -733,6 +733,8 @@
     "密钥已启用": "La clé a été activée",
     "密钥已复制到剪贴板": "Clé copiée dans le presse-papiers",
     "密钥已禁用": "La clé a été désactivée",
+    "密钥测试成功": "Test de la clé réussi",
+    "测试密钥失败": "Échec du test de la clé",
     "密钥文件 (.json)": "Fichier de clé (.json)",
     "密钥更新模式": "Mode de mise à jour de la clé",
     "密钥格式": "Format de la clé",

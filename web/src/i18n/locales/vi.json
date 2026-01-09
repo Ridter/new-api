@@ -692,6 +692,8 @@
     "密钥已启用": "Khóa đã được bật",
     "密钥已复制到剪贴板": "Khóa đã được sao chép vào khay nhớ tạm",
     "密钥已禁用": "Khóa đã bị vô hiệu hóa",
+    "密钥测试成功": "Kiểm tra khóa thành công",
+    "测试密钥失败": "Kiểm tra khóa thất bại",
     "密钥文件 (.json)": "Tệp khóa (.json)",
     "密钥更新模式": "Chế độ cập nhật khóa",
     "密钥格式": "Định dạng khóa",
