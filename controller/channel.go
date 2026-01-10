@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1182,6 +1183,53 @@ type KeyStatus struct {
 	DisabledTime int64  `json:"disabled_time,omitempty"`
 	Reason       string `json:"reason,omitempty"`
 	KeyPreview   string `json:"key_preview"` // first 10 chars of key for identification
+	Nickname     string `json:"nickname,omitempty"` // nickname extracted from JWT payload
+}
+
+// parseJWTNickname 从 JWT token 中解析 nickname
+// JWT 格式: header.payload.signature，payload 是 base64 编码的 JSON
+func parseJWTNickname(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "" // 不是有效的 JWT 格式
+	}
+
+	// 解码 payload 部分（第二部分）
+	payload := parts[1]
+	// JWT 使用 base64url 编码，需要处理 padding
+	// 添加必要的 padding
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		// 尝试使用标准 base64 解码
+		decoded, err = base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return ""
+		}
+	}
+
+	// 解析 JSON
+	var claims map[string]any
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return ""
+	}
+
+	// 尝试获取 nickname 字段（支持多种常见字段名）
+	for _, field := range []string{"nickname", "nick_name", "nickName", "name", "preferred_username", "username"} {
+		if val, ok := claims[field]; ok {
+			if strVal, ok := val.(string); ok && strVal != "" {
+				return strVal
+			}
+		}
+	}
+
+	return ""
 }
 
 // ManageMultiKeys handles multi-key management operations
@@ -1269,12 +1317,16 @@ func ManageMultiKeys(c *gin.Context) {
 				keyPreview = key[:10] + "..."
 			}
 
+			// 尝试从 JWT 中解析 nickname
+			nickname := parseJWTNickname(key)
+
 			allKeyStatusList = append(allKeyStatusList, KeyStatus{
 				Index:        i,
 				Status:       status,
 				DisabledTime: disabledTime,
 				Reason:       reason,
 				KeyPreview:   keyPreview,
+				Nickname:     nickname,
 			})
 		}
 
@@ -1667,8 +1719,14 @@ func ManageMultiKeys(c *gin.Context) {
 		tempChannel.ChannelInfo.IsMultiKey = false
 		tempChannel.ChannelInfo.MultiKeySize = 0
 
+		// 释放锁，避免 testChannel 内部调用 disableCurrentKey 时发生死锁
+		lock.Unlock()
+
 		tik := time.Now()
 		result := testChannel(&tempChannel, request.TestModel, "")
+
+		// 重新获取锁以保持 defer unlock 的正确性
+		lock.Lock()
 		tok := time.Now()
 		milliseconds := tok.Sub(tik).Milliseconds()
 		consumedTime := float64(milliseconds) / 1000.0

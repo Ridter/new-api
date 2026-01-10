@@ -2,6 +2,7 @@ package codebuddy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,39 @@ const FinishReasonContentFilter = "content_filter"
 
 // ErrSensitiveContent 敏感内容错误
 var ErrSensitiveContent = errors.New("sensitive content detected")
+
+// readResponseBodyWithTimeout 带超时的读取响应体
+// 防止在读取响应体时无限阻塞（例如上游服务器未正确关闭连接）
+func readResponseBodyWithTimeout(resp *http.Response, timeout time.Duration) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+
+	// 创建一个带超时的 context
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 使用 channel 来接收读取结果
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	resultCh := make(chan readResult, 1)
+
+	go func() {
+		data, err := io.ReadAll(resp.Body)
+		resultCh <- readResult{data: data, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		return result.data, result.err
+	case <-ctx.Done():
+		// 超时，关闭响应体以中断读取
+		resp.Body.Close()
+		return nil, fmt.Errorf("read response body timeout after %v", timeout)
+	}
+}
 
 // saveSensitiveRequest 将触发检测的请求保存到文件
 func saveSensitiveRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody []byte, response string, retryCount int) {
@@ -180,7 +214,7 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	return a.doRequestWithRateLimitRetry(c, info, bodyBytes)
 }
 
-// doRequestWithRateLimitRetry 发起请求，并在遇到 429 限流时自动切换 Key 重试
+// doRequestWithRateLimitRetry 发起请求，并在遇到 429 限流或 401 认证失败时进行处理
 func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte) (any, error) {
 	resp, err := channel.DoApiRequest(a, c, info, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -193,6 +227,12 @@ func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.
 	if resp.StatusCode == http.StatusTooManyRequests {
 		logger.LogInfo(c, "[CodeBuddy] 检测到 429 限流，开始处理...")
 		return a.handleRateLimitInRequest(c, info, bodyBytes, resp)
+	}
+
+	// 检查是否是 401 认证失败响应
+	if resp.StatusCode == http.StatusUnauthorized {
+		logger.LogWarn(c, "[CodeBuddy] 检测到 401 认证失败，开始处理...")
+		return a.handleUnauthorizedInRequest(c, info, resp)
 	}
 
 	return resp, nil
@@ -521,12 +561,16 @@ func parseRateLimitResetTime(errorBody string) *time.Time {
 	return &t
 }
 
-// handleRateLimitInRequest 在 DoRequest 阶段处理 429 限流，切换 Key 并重试
+// handleRateLimitInRequest 在 DoRequest 阶段处理 429 限流
+// 只有错误码为 6004 时才触发切换 Key 的逻辑，其他 429 错误直接透传
 func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte, resp *http.Response) (any, error) {
-	// 读取错误响应体
+	// 读取错误响应体，带超时保护防止阻塞
 	var errorBody string
 	if resp.Body != nil {
-		respBytes, _ := io.ReadAll(resp.Body)
+		respBytes, err := readResponseBodyWithTimeout(resp, 10*time.Second)
+		if err != nil {
+			logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 读取 429 响应体超时或失败: %v", err))
+		}
 		errorBody = string(respBytes)
 		resp.Body.Close()
 	}
@@ -541,6 +585,21 @@ func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.Rel
 		)
 	}
 
+	// 只有错误码为 6004 时才触发切换 Key 的逻辑
+	// 其他 429 错误直接透传给客户端
+	isCode6004 := strings.Contains(errorBody, `"code":6004`) || strings.Contains(errorBody, `"code": 6004`)
+	if !isCode6004 {
+		logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 429 错误但非 6004 错误码，直接透传，错误信息: %s", errorBody))
+		// 返回错误，让上层通过 RelayErrorHandler 处理并透传给客户端
+		return nil, types.NewError(
+			fmt.Errorf("rate limited (non-6004): %s", errorBody),
+			types.ErrorCodeRateLimited,
+		)
+	}
+
+	// 以下是 6004 错误码的处理逻辑：切换 Key 并重试
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 检测到 6004 错误码，开始切换 Key 处理，错误信息: %s", errorBody))
+
 	// 获取当前重试次数
 	retryCount := c.GetInt("codebuddy_ratelimit_retry")
 
@@ -552,7 +611,7 @@ func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.Rel
 		if cooldownDuration < 0 {
 			cooldownDuration = 0
 		}
-		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流，Key index: %d 冷却至 %s (还需 %v)",
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流 (6004)，Key index: %d 冷却至 %s (还需 %v)",
 			info.ChannelMultiKeyIndex, resetTime.Format("2006-01-02 15:04:05"), cooldownDuration))
 
 		// 设置当前 Key 的冷却时间
@@ -560,14 +619,14 @@ func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.Rel
 	} else {
 		// 无法解析冷却时间，设置默认冷却时间（1小时）
 		defaultCooldown := time.Now().Add(1 * time.Hour)
-		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流，Key index: %d，无法解析冷却时间，设置默认冷却1小时，错误信息: %s",
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 429 限流 (6004)，Key index: %d，无法解析冷却时间，设置默认冷却1小时，错误信息: %s",
 			info.ChannelMultiKeyIndex, errorBody))
 		a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, defaultCooldown)
 	}
 
 	// 检查是否还有重试次数
 	if retryCount >= MaxRateLimitRetries {
-		logger.LogError(c, fmt.Sprintf("[CodeBuddy] 429 限流重试次数已达上限 (%d次)，触发渠道切换", MaxRateLimitRetries))
+		logger.LogError(c, fmt.Sprintf("[CodeBuddy] 429 限流 (6004) 重试次数已达上限 (%d次)，触发渠道切换", MaxRateLimitRetries))
 		// 返回 channel error，触发上层切换渠道
 		return nil, types.NewError(
 			fmt.Errorf("all keys rate limited: %s", errorBody),
@@ -588,20 +647,11 @@ func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.Rel
 		)
 	}
 
-	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 429 限流，已切换到新 Key (index: %d)，正在重试 (%d/%d)",
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 429 限流 (6004)，已切换到新 Key (index: %d)，正在重试 (%d/%d)",
 		info.ChannelMultiKeyIndex, retryCount+1, MaxRateLimitRetries))
 
 	// 递归重试请求
 	return a.doRequestWithRateLimitRetry(c, info, bodyBytes)
-}
-
-// createErrorResponse 创建一个模拟的错误响应，用于返回给上层
-func createErrorResponse(statusCode int, body string) *http.Response {
-	return &http.Response{
-		StatusCode: statusCode,
-		Body:       io.NopCloser(strings.NewReader(body)),
-		Header:     make(http.Header),
-	}
 }
 
 // setKeyCooldown 设置指定 Key 的冷却时间
@@ -711,4 +761,62 @@ func (a *Adaptor) switchToNextKey(c *gin.Context, info *relaycommon.RelayInfo) e
 
 	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 已切换 API Key: index %d -> %d", oldIndex, newIndex))
 	return nil
+}
+
+// handleUnauthorizedInRequest 在 DoRequest 阶段处理 401 认证失败，禁用当前 Key 并触发渠道切换
+func (a *Adaptor) handleUnauthorizedInRequest(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (any, error) {
+	// 读取错误响应体，带超时保护防止阻塞
+	var errorBody string
+	if resp.Body != nil {
+		respBytes, err := readResponseBodyWithTimeout(resp, 10*time.Second)
+		if err != nil {
+			logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 读取 401 响应体超时或失败: %v", err))
+		}
+		errorBody = string(respBytes)
+		resp.Body.Close()
+	}
+
+	logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 401 认证失败，Key index: %d，错误信息: %s", info.ChannelMultiKeyIndex, errorBody))
+
+	// 禁用当前 Key
+	a.disableCurrentKey(c, info, "401 Unauthorized: "+errorBody)
+
+	// 直接返回错误，触发渠道切换
+	return nil, types.NewError(
+		fmt.Errorf("key unauthorized: %s", errorBody),
+		types.ErrorCodeChannelInvalidKey,
+	)
+}
+
+// disableCurrentKey 禁用当前使用的 Key
+func (a *Adaptor) disableCurrentKey(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
+	ch, err := model.CacheGetChannel(info.ChannelId)
+	if err != nil {
+		logger.LogError(c, fmt.Sprintf("[CodeBuddy] 获取渠道信息失败: %v", err))
+		return
+	}
+
+	// 获取渠道轮询锁
+	lock := model.GetChannelPollingLock(info.ChannelId)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// 初始化状态 map
+	if ch.ChannelInfo.MultiKeyStatusList == nil {
+		ch.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+	}
+	if ch.ChannelInfo.MultiKeyDisabledReason == nil {
+		ch.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+	}
+	if ch.ChannelInfo.MultiKeyDisabledTime == nil {
+		ch.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
+	}
+
+	// 设置 Key 状态为禁用
+	keyIndex := info.ChannelMultiKeyIndex
+	ch.ChannelInfo.MultiKeyStatusList[keyIndex] = common.ChannelStatusAutoDisabled
+	ch.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
+	ch.ChannelInfo.MultiKeyDisabledTime[keyIndex] = time.Now().Unix()
+
+	logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 已禁用 Key index: %d，原因: %s", keyIndex, reason))
 }

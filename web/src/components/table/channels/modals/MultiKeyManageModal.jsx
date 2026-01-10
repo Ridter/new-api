@@ -386,17 +386,26 @@ const MultiKeyManageModal = ({ visible, onCancel, channel, onRefresh }) => {
     {
       title: t('索引'),
       dataIndex: 'index',
+      width: 80,
       render: (text) => `#${text}`,
     },
-    // {
-    //   title: t('密钥预览'),
-    //   dataIndex: 'key_preview',
-    //   render: (text) => (
-    //     <Text code style={{ fontSize: '12px' }}>
-    //       {text}
-    //     </Text>
-    //   ),
-    // },
+    {
+      title: t('名称'),
+      dataIndex: 'nickname',
+      width: 150,
+      render: (nickname) => {
+        if (!nickname) {
+          return <Text type='quaternary'>-</Text>;
+        }
+        return (
+          <Tooltip content={nickname}>
+            <Text style={{ maxWidth: '140px', display: 'block' }} ellipsis>
+              {nickname}
+            </Text>
+          </Tooltip>
+        );
+      },
+    },
     {
       title: t('状态'),
       dataIndex: 'status',
