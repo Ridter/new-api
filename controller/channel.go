@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/codebuddy"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/service"
@@ -280,6 +281,35 @@ func FetchUpstreamModels(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": fmt.Sprintf("获取Gemini模型失败: %s", err.Error()),
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "",
+			"data":    models,
+		})
+		return
+	}
+
+	// 对于 CodeBuddy 渠道，使用特殊处理
+	if channel.Type == constant.ChannelTypeCodeBuddy {
+		// 获取用于请求的可用密钥（多密钥渠道优先使用启用状态的密钥）
+		key, _, apiErr := channel.GetNextEnabledKey()
+		if apiErr != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": fmt.Sprintf("获取渠道密钥失败: %s", apiErr.Error()),
+			})
+			return
+		}
+		key = strings.TrimSpace(key)
+		models, err := codebuddy.FetchCodeBuddyModels(baseURL, key, channel.GetHeaderOverride())
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": fmt.Sprintf("获取CodeBuddy模型失败: %s", err.Error()),
 			})
 			return
 		}
