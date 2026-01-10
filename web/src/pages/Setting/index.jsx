@@ -32,6 +32,7 @@ import {
   MessageSquare,
   Palette,
   CreditCard,
+  DatabaseBackup,
 } from 'lucide-react';
 
 import SystemSetting from '../../components/settings/SystemSetting';
@@ -45,6 +46,7 @@ import RatioSetting from '../../components/settings/RatioSetting';
 import ChatsSetting from '../../components/settings/ChatsSetting';
 import DrawingSetting from '../../components/settings/DrawingSetting';
 import PaymentSetting from '../../components/settings/PaymentSetting';
+import BackupSetting from '../../components/settings/BackupSetting';
 
 const Setting = () => {
   const { t } = useTranslation();
@@ -143,6 +145,16 @@ const Setting = () => {
       ),
       content: <SystemSetting />,
       itemKey: 'system',
+    });
+    panes.push({
+      tab: (
+        <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+          <DatabaseBackup size={18} />
+          {t('数据备份')}
+        </span>
+      ),
+      content: <BackupSetting />,
+      itemKey: 'backup',
     });
     panes.push({
       tab: (

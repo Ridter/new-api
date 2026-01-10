@@ -122,6 +122,12 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.POST("/rest_model_ratio", controller.ResetModelRatio)
 			optionRoute.POST("/migrate_console_setting", controller.MigrateConsoleSetting) // 用于迁移检测的旧键，下个版本会删除
 		}
+		backupRoute := apiRouter.Group("/backup")
+		backupRoute.Use(middleware.RootAuth())
+		{
+			backupRoute.POST("/export", controller.ExportBackup)
+			backupRoute.POST("/import", controller.ImportBackup)
+		}
 		ratioSyncRoute := apiRouter.Group("/ratio_sync")
 		ratioSyncRoute.Use(middleware.RootAuth())
 		{
