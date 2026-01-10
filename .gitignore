@@ -19,6 +19,7 @@ tiktoken_cache
 .gomodcache/
 .cache
 web/bun.lock
+plans
 
 electron/node_modules
 electron/dist
@@ -26,3 +27,7 @@ data/
 
 # Claude Code local settings (may contain sensitive info)
 .claude/settings.local.json
+
+# Go cache directories
+.gocache-temp
+.gopath
