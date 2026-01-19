@@ -561,6 +561,21 @@ func parseRateLimitResetTime(errorBody string) *time.Time {
 	return &t
 }
 
+// getNextMonthFirstDay 获取下个月 1 日 0 点的时间
+// 用于额度用尽时设置 Key 冷却到下个月
+func getNextMonthFirstDay() time.Time {
+	now := time.Now()
+	// 获取下个月的第一天
+	year, month, _ := now.Date()
+	nextMonth := month + 1
+	nextYear := year
+	if nextMonth > 12 {
+		nextMonth = 1
+		nextYear++
+	}
+	return time.Date(nextYear, nextMonth, 1, 0, 0, 0, 0, now.Location())
+}
+
 // handleRateLimitInRequest 在 DoRequest 阶段处理 429 限流
 // 只有错误码为 6004 时才触发切换 Key 的逻辑，其他 429 错误直接透传
 func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte, resp *http.Response) (any, error) {
@@ -583,6 +598,30 @@ func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.Rel
 			fmt.Errorf("model unavailable: %s", errorBody),
 			types.ErrorCodeBadResponse,
 		)
+	}
+
+	// 检查是否是额度用尽的错误（code: 14013）
+	// 额度用尽时，将 Key 冷却到下个月 1 日，然后触发渠道切换
+	if strings.Contains(errorBody, `"code":14013`) || strings.Contains(errorBody, `"code": 14013`) {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 检测到额度用尽 (14013)，Key index: %d，错误信息: %s", info.ChannelMultiKeyIndex, errorBody))
+
+		// 计算下个月 1 日的时间
+		nextMonthFirst := getNextMonthFirstDay()
+		a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, nextMonthFirst)
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] Key index: %d 已设置冷却至下月1日: %s", info.ChannelMultiKeyIndex, nextMonthFirst.Format("2006-01-02 15:04:05")))
+
+		// 尝试切换到其他可用的 Key
+		if err := a.switchToNextAvailableKey(c, info); err != nil {
+			logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 切换 Key 失败: %v，触发渠道切换", err))
+			return nil, types.NewError(
+				fmt.Errorf("quota exhausted and no available keys: %s", errorBody),
+				types.ErrorCodeChannelAllKeysRateLimited,
+			)
+		}
+
+		// 成功切换到新 Key，重试请求
+		logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 额度用尽，已切换到新 Key (index: %d)，正在重试", info.ChannelMultiKeyIndex))
+		return a.doRequestWithRateLimitRetry(c, info, bodyBytes)
 	}
 
 	// 只有错误码为 6004 时才触发切换 Key 的逻辑
