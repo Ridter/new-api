@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -11,6 +12,17 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 )
+
+// billingHeaderRegex 用于清理 x-anthropic-billing-header 相关内容
+var billingHeaderRegex = regexp.MustCompile(`x-anthropic-billing-header: \?cc_version=.+; \?cc_entrypoint=\w+\n{0,2}`)
+
+// cleanBillingHeader 清理消息内容中的 x-anthropic-billing-header
+func cleanBillingHeader(content string) string {
+	if strings.Contains(content, "x-anthropic-billing-header") {
+		return billingHeaderRegex.ReplaceAllString(content, "")
+	}
+	return content
+}
 
 func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.RelayInfo) (*dto.GeneralOpenAIRequest, error) {
 	openAIRequest := dto.GeneralOpenAIRequest{
@@ -82,11 +94,14 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 	// Add system message if present
 	if claudeRequest.System != nil {
 		if claudeRequest.IsStringSystem() && claudeRequest.GetStringSystem() != "" {
-			openAIMessage := dto.Message{
-				Role: "system",
+			systemContent := cleanBillingHeader(claudeRequest.GetStringSystem())
+			if systemContent != "" {
+				openAIMessage := dto.Message{
+					Role: "system",
+				}
+				openAIMessage.SetStringContent(systemContent)
+				openAIMessages = append(openAIMessages, openAIMessage)
 			}
-			openAIMessage.SetStringContent(claudeRequest.GetStringSystem())
-			openAIMessages = append(openAIMessages, openAIMessage)
 		} else {
 			systems := claudeRequest.ParseSystem()
 			if len(systems) > 0 {
@@ -97,14 +112,20 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 				if isOpenRouterClaude {
 					systemMediaMessages := make([]dto.MediaContent, 0, len(systems))
 					for _, system := range systems {
-						message := dto.MediaContent{
-							Type:         "text",
-							Text:         system.GetText(),
-							CacheControl: system.CacheControl,
+						text := cleanBillingHeader(system.GetText())
+						if text != "" {
+							message := dto.MediaContent{
+								Type:         "text",
+								Text:         text,
+								CacheControl: system.CacheControl,
+							}
+							systemMediaMessages = append(systemMediaMessages, message)
 						}
-						systemMediaMessages = append(systemMediaMessages, message)
 					}
-					openAIMessage.SetMediaContent(systemMediaMessages)
+					if len(systemMediaMessages) > 0 {
+						openAIMessage.SetMediaContent(systemMediaMessages)
+						openAIMessages = append(openAIMessages, openAIMessage)
+					}
 				} else {
 					systemStr := ""
 					for _, system := range systems {
@@ -112,9 +133,12 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 							systemStr += *system.Text
 						}
 					}
-					openAIMessage.SetStringContent(systemStr)
+					systemStr = cleanBillingHeader(systemStr)
+					if systemStr != "" {
+						openAIMessage.SetStringContent(systemStr)
+						openAIMessages = append(openAIMessages, openAIMessage)
+					}
 				}
-				openAIMessages = append(openAIMessages, openAIMessage)
 			}
 		}
 	}
