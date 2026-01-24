@@ -301,6 +301,7 @@ export function getChannelIcon(channelType) {
   switch (channelType) {
     case 1: // OpenAI
     case 3: // Azure OpenAI
+    case 57: // Codex
       return <OpenAI size={iconSize} />;
     case 2: // Midjourney Proxy
     case 5: // Midjourney Proxy Plus
@@ -371,7 +372,7 @@ export function getChannelIcon(channelType) {
       return <Doubao.Color size={iconSize} />;
     case 56: // Replicate
       return <Replicate size={iconSize} />;
-    case 57: // CodeBuddy
+    case 58: // CodeBuddy
       return <TerminalSquare size={iconSize} />;
     case 8: // 自定义渠道
     case 22: // 知识库：FastGPT

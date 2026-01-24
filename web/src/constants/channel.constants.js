@@ -187,6 +187,11 @@ export const CHANNEL_OPTIONS = [
   {
     value: 57,
     color: 'blue',
+    label: 'Codex (OpenAI OAuth)',
+  },
+  {
+    value: 58,
+    color: 'blue',
     label: 'CodeBuddy',
   },
 ];
