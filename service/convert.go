@@ -14,7 +14,8 @@ import (
 )
 
 // billingHeaderRegex 用于清理 x-anthropic-billing-header 相关内容
-var billingHeaderRegex = regexp.MustCompile(`x-anthropic-billing-header: \?cc_version=.+; \?cc_entrypoint=\w+\n{0,2}`)
+// 格式示例: "x-anthropic-billing-header: cc_version=2.1.19.a98; cc_entrypoint=cli"
+var billingHeaderRegex = regexp.MustCompile(`x-anthropic-billing-header:\s*cc_version=[^;]+;\s*cc_entrypoint=\w+`)
 
 // cleanBillingHeader 清理消息内容中的 x-anthropic-billing-header
 func cleanBillingHeader(content string) string {
@@ -149,7 +150,8 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 
 		//log.Printf("claudeMessage.Content: %v", claudeMessage.Content)
 		if claudeMessage.IsStringContent() {
-			openAIMessage.SetStringContent(claudeMessage.GetStringContent())
+			content := cleanBillingHeader(claudeMessage.GetStringContent())
+			openAIMessage.SetStringContent(content)
 		} else {
 			content, err := claudeMessage.ParseContent()
 			if err != nil {
@@ -162,12 +164,15 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 			for _, mediaMsg := range contents {
 				switch mediaMsg.Type {
 				case "text":
-					message := dto.MediaContent{
-						Type:         "text",
-						Text:         mediaMsg.GetText(),
-						CacheControl: mediaMsg.CacheControl,
+					text := cleanBillingHeader(mediaMsg.GetText())
+					if text != "" {
+						message := dto.MediaContent{
+							Type:         "text",
+							Text:         text,
+							CacheControl: mediaMsg.CacheControl,
+						}
+						mediaMessages = append(mediaMessages, message)
 					}
-					mediaMessages = append(mediaMessages, message)
 				case "image":
 					// Handle image conversion (base64 to URL or keep as is)
 					imageData := fmt.Sprintf("data:%s;base64,%s", mediaMsg.Source.MediaType, mediaMsg.Source.Data)
