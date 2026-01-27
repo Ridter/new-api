@@ -712,6 +712,11 @@ func (a *Adaptor) setKeyCooldown(channelId int, keyIndex int, resetTime time.Tim
 
 	// 设置冷却结束时间（Unix 时间戳）
 	ch.ChannelInfo.MultiKeyCooldownUntil[keyIndex] = resetTime.Unix()
+
+	// 持久化到数据库
+	if err := ch.SaveChannelInfo(); err != nil {
+		common.SysError(fmt.Sprintf("[CodeBuddy] 保存冷却信息失败: %v", err))
+	}
 }
 
 // switchToNextAvailableKey 切换到下一个可用的 Key（跳过冷却中的 Key）

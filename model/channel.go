@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -121,6 +122,9 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	defer lock.Unlock()
 
 	statusList := channel.ChannelInfo.MultiKeyStatusList
+	cooldownMap := channel.ChannelInfo.MultiKeyCooldownUntil
+	now := time.Now().Unix()
+
 	// helper to get key status, default to enabled when missing
 	getStatus := func(idx int) int {
 		if statusList == nil {
@@ -132,10 +136,28 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return common.ChannelStatusEnabled
 	}
 
-	// Collect indexes of enabled keys
+	// helper to check if key is in cooldown
+	// also cleans up expired cooldown entries
+	isInCooldown := func(idx int) bool {
+		if cooldownMap == nil {
+			return false
+		}
+		cooldownUntil, ok := cooldownMap[idx]
+		if !ok {
+			return false
+		}
+		if cooldownUntil <= now {
+			// Cooldown expired, remove from map
+			delete(cooldownMap, idx)
+			return false
+		}
+		return true
+	}
+
+	// Collect indexes of enabled keys that are not in cooldown
 	enabledIdx := make([]int, 0, len(keys))
 	for i := range keys {
-		if getStatus(i) == common.ChannelStatusEnabled {
+		if getStatus(i) == common.ChannelStatusEnabled && !isInCooldown(i) {
 			enabledIdx = append(enabledIdx, i)
 		}
 	}
@@ -176,7 +198,7 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		}
 		for i := 0; i < len(keys); i++ {
 			idx := (start + i) % len(keys)
-			if getStatus(idx) == common.ChannelStatusEnabled {
+			if getStatus(idx) == common.ChannelStatusEnabled && !isInCooldown(idx) {
 				// update polling index for next call (point to the next position)
 				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
 				return keys[idx], idx, nil

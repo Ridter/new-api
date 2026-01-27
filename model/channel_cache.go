@@ -70,11 +70,24 @@ func InitChannelCache() {
 	for i, channel := range newChannelId2channel {
 		if channel.ChannelInfo.IsMultiKey {
 			channel.Keys = channel.GetKeys()
-			if channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
-				if oldChannel, ok := channelsIDM[i]; ok {
-					// 存在旧的渠道，如果是多key且轮询，保留轮询索引信息
-					if oldChannel.ChannelInfo.IsMultiKey && oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
-						channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
+			if oldChannel, ok := channelsIDM[i]; ok && oldChannel.ChannelInfo.IsMultiKey {
+				// 保留轮询索引信息
+				if channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling &&
+					oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+					channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
+				}
+				// 保留冷却信息，避免缓存同步时丢失
+				// 数据库中的数据优先，但保留内存中更新的数据（防止持久化延迟导致丢失）
+				if oldChannel.ChannelInfo.MultiKeyCooldownUntil != nil &&
+					len(oldChannel.ChannelInfo.MultiKeyCooldownUntil) > 0 {
+					if channel.ChannelInfo.MultiKeyCooldownUntil == nil {
+						channel.ChannelInfo.MultiKeyCooldownUntil = make(map[int]int64)
+					}
+					for keyIdx, cooldownUntil := range oldChannel.ChannelInfo.MultiKeyCooldownUntil {
+						// 如果数据库中没有这个 key 的冷却信息，使用内存中的
+						if _, exists := channel.ChannelInfo.MultiKeyCooldownUntil[keyIdx]; !exists {
+							channel.ChannelInfo.MultiKeyCooldownUntil[keyIdx] = cooldownUntil
+						}
 					}
 				}
 			}
