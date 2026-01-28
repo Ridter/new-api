@@ -2,6 +2,7 @@ package codebuddy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -100,6 +101,7 @@ func getHeaderOrGenerate(c *gin.Context, key string, generator func() string) st
 
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
 	req.Set("Content-Type", "application/json")
+	req.Set("Content-Encoding", "gzip")
 	if info.IsStream {
 		req.Set("Accept", "text/event-stream")
 	}
@@ -201,7 +203,29 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
-	return a.doRequestWithRateLimitRetry(c, info, bodyBytes)
+
+	// Gzip compress the request body
+	compressedBody, err := gzipCompress(bodyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to gzip compress request body: %w", err)
+	}
+
+	return a.doRequestWithRateLimitRetry(c, info, compressedBody)
+}
+
+// gzipCompress compresses data using gzip
+func gzipCompress(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buf)
+	_, err := gzipWriter.Write(data)
+	if err != nil {
+		return nil, err
+	}
+	err = gzipWriter.Close()
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte) (any, error) {
