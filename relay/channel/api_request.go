@@ -24,6 +24,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// DebugProxyEnabled 全局调试代理开关，设为 true 时所有上游请求都会使用 DebugProxyURL
+const DebugProxyEnabled = false
+
+// DebugProxyURL 调试代理地址，如 http://127.0.0.1:8080
+const DebugProxyURL = "http://127.0.0.1:8080"
+
 func SetupApiRequestHeader(info *common.RelayInfo, c *gin.Context, req *http.Header) {
 	if info.RelayMode == constant.RelayModeAudioTranscription || info.RelayMode == constant.RelayModeAudioTranslation {
 		// multipart/form-data
@@ -255,7 +261,15 @@ func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	var client *http.Client
 	var err error
-	if info.ChannelSetting.Proxy != "" {
+
+	// 优先使用全局调试代理
+	if DebugProxyEnabled {
+		client, err = service.NewProxyHttpClient(DebugProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("new debug proxy http client failed: %w", err)
+		}
+		logger.LogInfo(c, fmt.Sprintf("[DebugProxy] 使用调试代理 %s 发送请求到 %s", DebugProxyURL, req.URL.String()))
+	} else if info.ChannelSetting.Proxy != "" {
 		client, err = service.NewProxyHttpClient(info.ChannelSetting.Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("new proxy http client failed: %w", err)

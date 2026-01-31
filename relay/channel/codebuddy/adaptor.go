@@ -26,6 +26,9 @@ import (
 
 const MaxRateLimitRetries = 3
 
+// EnableGzip 控制是否启用 gzip 压缩，方便调试
+const EnableGzip = true
+
 func readResponseBodyWithTimeout(resp *http.Response, timeout time.Duration) ([]byte, error) {
 	if resp == nil || resp.Body == nil {
 		return nil, nil
@@ -101,7 +104,9 @@ func getHeaderOrGenerate(c *gin.Context, key string, generator func() string) st
 
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
 	req.Set("Content-Type", "application/json")
-	req.Set("Content-Encoding", "gzip")
+	if EnableGzip {
+		req.Set("Content-Encoding", "gzip")
+	}
 	if info.IsStream {
 		req.Set("Accept", "text/event-stream")
 	}
@@ -204,13 +209,19 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
 
-	// Gzip compress the request body
-	compressedBody, err := gzipCompress(bodyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to gzip compress request body: %w", err)
+	var requestBodyBytes []byte
+	if EnableGzip {
+		// Gzip compress the request body
+		compressedBody, err := gzipCompress(bodyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to gzip compress request body: %w", err)
+		}
+		requestBodyBytes = compressedBody
+	} else {
+		requestBodyBytes = bodyBytes
 	}
 
-	return a.doRequestWithRateLimitRetry(c, info, compressedBody)
+	return a.doRequestWithRateLimitRetry(c, info, requestBodyBytes)
 }
 
 // gzipCompress compresses data using gzip
@@ -228,17 +239,29 @@ func gzipCompress(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte) (any, error) {
-	resp, err := channel.DoApiRequest(a, c, info, bytes.NewReader(bodyBytes))
+func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.RelayInfo, compressedBody []byte) (any, error) {
+	// 对于非 -ioa 模型，检查当前 Key 是否在冷却中
+	// 这是因为 GetNextEnabledKey 会为 CodeBuddy 渠道选择冷却中的 Key（为了支持 -ioa 模型）
+	// 但非 -ioa 模型不能使用冷却中的 Key
+	if !isIOAModel(info.UpstreamModelName) {
+		if err := a.ensureKeyNotInCooldown(c, info, compressedBody); err != nil {
+			return nil, err
+		}
+	}
+
+	// 记录当前使用的 Key 信息
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 发送请求: channel=%d, keyIndex=%d, model=%s", info.ChannelId, info.ChannelMultiKeyIndex, info.UpstreamModelName))
+
+	resp, err := channel.DoApiRequest(a, c, info, bytes.NewReader(compressedBody))
 	if err != nil {
 		return nil, err
 	}
 
-	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] DoRequest 响应状态码: %d", resp.StatusCode))
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] DoRequest 响应状态码: %d, keyIndex=%d", resp.StatusCode, info.ChannelMultiKeyIndex))
 
 	// 检查是否是 14013 额度用尽
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return a.handleRateLimitInRequest(c, info, bodyBytes, resp)
+		return a.handleRateLimitInRequest(c, info, compressedBody, resp)
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -380,18 +403,24 @@ func (a *Adaptor) canRetry(c *gin.Context) bool {
 // retryWithNewKey 切换 Key 并重试请求
 func (a *Adaptor) retryWithNewKey(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte, errorBody string) (any, error) {
 	if !a.canRetry(c) {
-		logger.LogError(c, fmt.Sprintf("[CodeBuddy] 重试次数已达上限 (%d次)，触发渠道切换", MaxRateLimitRetries))
-		return nil, types.NewError(
-			fmt.Errorf("all keys rate limited: %s", errorBody),
-			types.ErrorCodeChannelAllKeysRateLimited,
+		logger.LogError(c, fmt.Sprintf("[CodeBuddy] 重试次数已达上限 (%d次)，不再重试", MaxRateLimitRetries))
+		// 达到重试上限，返回错误并跳过重试
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("all keys quota exhausted after %d retries: %s", MaxRateLimitRetries, errorBody),
+			types.ErrorCodeRateLimited,
+			http.StatusPaymentRequired,
+			types.ErrOptionWithSkipRetry(),
 		)
 	}
 
 	if err := a.switchToNextAvailableKey(c, info); err != nil {
-		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 切换 Key 失败: %v，触发渠道切换", err))
-		return nil, types.NewError(
-			fmt.Errorf("no available keys: %s", errorBody),
-			types.ErrorCodeChannelAllKeysRateLimited,
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 切换 Key 失败: %v，当前渠道无可用 Key", err))
+		// 当前渠道所有 Key 都不可用，返回 channel error 让上层尝试切换渠道
+		// 注意：不设置 SkipRetry，让 controller 有机会切换到其他渠道
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("all keys unavailable in channel %d: %s", info.ChannelId, errorBody),
+			types.ErrorCodeChannelInvalidKey,
+			http.StatusPaymentRequired,
 		)
 	}
 
@@ -445,10 +474,53 @@ func (a *Adaptor) readAndCloseResponseBody(c *gin.Context, resp *http.Response) 
 	return string(respBytes)
 }
 
-// setKeyCooldown 设置指定 Key 的冷却时间
+// ensureKeyNotInCooldown 确保当前 Key 不在冷却中（仅对非 -ioa 模型）
+// 如果当前 Key 在冷却中，会尝试切换到其他可用 Key
+func (a *Adaptor) ensureKeyNotInCooldown(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte) error {
+	ch, err := model.CacheGetChannel(info.ChannelId)
+	if err != nil {
+		return fmt.Errorf("获取渠道信息失败: %w", err)
+	}
+
+	// 获取渠道轮询锁
+	lock := model.GetChannelPollingLock(info.ChannelId)
+	lock.Lock()
+	cooldownMap := ch.ChannelInfo.MultiKeyCooldownUntil
+	lock.Unlock()
+
+	if cooldownMap == nil {
+		return nil
+	}
+
+	now := time.Now().Unix()
+	cooldownUntil, inCooldown := cooldownMap[info.ChannelMultiKeyIndex]
+	if !inCooldown || cooldownUntil <= now {
+		return nil // Key 不在冷却中，可以正常使用
+	}
+
+	// 当前 Key 在冷却中，需要切换
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 当前 Key index %d 在冷却中 (until=%d, now=%d)，尝试切换到其他 Key",
+		info.ChannelMultiKeyIndex, cooldownUntil, now))
+
+	if err := a.switchToNextAvailableKey(c, info); err != nil {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 切换 Key 失败: %v，当前渠道无可用 Key", err))
+		// 当前渠道所有 Key 都不可用，返回 channel error 让上层尝试切换渠道
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("all keys in cooldown for non-ioa model in channel %d", info.ChannelId),
+			types.ErrorCodeChannelInvalidKey,
+			http.StatusPaymentRequired,
+		)
+	}
+
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 已切换到 Key index %d", info.ChannelMultiKeyIndex))
+	return nil
+}
+
+// setKeyCooldown 设置指定 Key 的冷却时间（针对所有非 -ioa 模型）
 func (a *Adaptor) setKeyCooldown(channelId int, keyIndex int, resetTime time.Time) {
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
+		common.SysError(fmt.Sprintf("[CodeBuddy] setKeyCooldown 获取渠道失败: %v", err))
 		return
 	}
 
@@ -465,6 +537,9 @@ func (a *Adaptor) setKeyCooldown(channelId int, keyIndex int, resetTime time.Tim
 	// 设置冷却结束时间（Unix 时间戳）
 	ch.ChannelInfo.MultiKeyCooldownUntil[keyIndex] = resetTime.Unix()
 
+	common.SysLog(fmt.Sprintf("[CodeBuddy] 设置冷却: channel=%d, keyIndex=%d, until=%s",
+		channelId, keyIndex, resetTime.Format("2006-01-02")))
+
 	// 持久化到数据库
 	if err := ch.SaveChannelInfo(); err != nil {
 		common.SysError(fmt.Sprintf("[CodeBuddy] 保存冷却信息失败: %v", err))
@@ -480,6 +555,8 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 
 	// 获取所有 Key
 	keys := ch.GetKeys()
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] switchToNextAvailableKey: 总共 %d 个 Key, 当前 index: %d", len(keys), info.ChannelMultiKeyIndex))
+
 	if len(keys) <= 1 {
 		return errors.New("没有其他可用的 Key")
 	}
@@ -500,6 +577,7 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 		if ch.ChannelInfo.MultiKeyStatusList != nil {
 			if status, ok := ch.ChannelInfo.MultiKeyStatusList[nextIndex]; ok {
 				if status != common.ChannelStatusEnabled {
+					logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 被禁用 (status=%d)，跳过", nextIndex, status))
 					continue
 				}
 			}
@@ -511,7 +589,7 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 				if cooldownUntil, ok := ch.ChannelInfo.MultiKeyCooldownUntil[nextIndex]; ok {
 					if cooldownUntil > now {
 						// 仍在冷却中
-						logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 仍在冷却中，跳过", nextIndex))
+						logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 仍在冷却中 (until=%d, now=%d)，跳过", nextIndex, cooldownUntil, now))
 						continue
 					}
 				}
@@ -529,6 +607,7 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 		return nil
 	}
 
+	logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 所有 Key 都不可用! cooldownMap=%v, statusList=%v", ch.ChannelInfo.MultiKeyCooldownUntil, ch.ChannelInfo.MultiKeyStatusList))
 	return errors.New("所有 Key 都在冷却中或被禁用")
 }
 

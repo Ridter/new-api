@@ -181,8 +181,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	// 渠道切换重试次数（当遇到 channel error 时额外允许的重试次数）
 	// 这是独立于 RetryTimes 的，确保即使 RetryTimes=0 也能进行渠道切换
-	const maxChannelSwitchRetries = 5
+	const maxChannelSwitchRetries = 2
 	channelSwitchRetries := 0
+	channelSwitchInitialized := false // 标记是否已初始化渠道切换重试
 
 	for ; retryParam.GetRetry() <= common.RetryTimes || channelSwitchRetries > 0; retryParam.IncreaseRetry() {
 		// 如果是渠道切换重试，减少计数
@@ -231,9 +232,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 
-		// 如果是 channel error 且 RetryTimes=0，允许额外的渠道切换重试
-		if types.IsChannelError(newAPIError) && common.RetryTimes == 0 && channelSwitchRetries == 0 {
+		// 如果是 channel error 且 RetryTimes=0，只允许初始化一次渠道切换重试
+		if types.IsChannelError(newAPIError) && common.RetryTimes == 0 && !channelSwitchInitialized {
 			channelSwitchRetries = maxChannelSwitchRetries
+			channelSwitchInitialized = true
 			logger.LogInfo(c, fmt.Sprintf("检测到渠道错误，允许额外 %d 次渠道切换重试", maxChannelSwitchRetries))
 		}
 	}
@@ -321,11 +323,12 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if openaiErr == nil {
 		return false
 	}
-	if types.IsChannelError(openaiErr) {
-		return true
-	}
+	// SkipRetry 检查必须在 IsChannelError 之前，否则 channel error + skipRetry 仍会重试
 	if types.IsSkipRetryError(openaiErr) {
 		return false
+	}
+	if types.IsChannelError(openaiErr) {
+		return true
 	}
 	if retryTimes <= 0 {
 		return false
