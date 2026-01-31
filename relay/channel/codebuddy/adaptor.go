@@ -236,9 +236,8 @@ func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.
 
 	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] DoRequest 响应状态码: %d", resp.StatusCode))
 
-	// 检查是否是 429 限流响应
+	// 检查是否是 14013 额度用尽
 	if resp.StatusCode == http.StatusTooManyRequests {
-		logger.LogInfo(c, "[CodeBuddy] 检测到 429 限流，开始处理...")
 		return a.handleRateLimitInRequest(c, info, bodyBytes, resp)
 	}
 
@@ -345,6 +344,10 @@ func (a *Adaptor) GetChannelName() string {
 	return ChannelName
 }
 
+func isIOAModel(modelName string) bool {
+	return strings.HasSuffix(modelName, "-ioa")
+}
+
 func getNextMonthFirstDay() time.Time {
 	now := time.Now()
 	year, month, _ := now.Date()
@@ -406,19 +409,21 @@ func containsErrorCode(body string, code int) bool {
 	return strings.Contains(body, codeStr) || strings.Contains(body, codeStrWithSpace)
 }
 
-// handleRateLimitInRequest 在 DoRequest 阶段处理 429 限流
+// handleRateLimitInRequest 处理 14013 额度用尽错误
 func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte, resp *http.Response) (any, error) {
 	errorBody := a.readAndCloseResponseBody(c, resp)
 
 	// 14013: 额度用尽，冷却到下月1日后切换 Key
 	if containsErrorCode(errorBody, 14013) {
-		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 额度用尽 (14013)，Key index: %d: %s", info.ChannelMultiKeyIndex, errorBody))
-		a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, getNextMonthFirstDay())
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 额度用尽 (14013)，Key index: %d, model: %s: %s", info.ChannelMultiKeyIndex, info.UpstreamModelName, errorBody))
+		// -ioa 模型不设置冷却（理论上不会触发 14013）
+		if !isIOAModel(info.UpstreamModelName) {
+			a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, getNextMonthFirstDay())
+		}
 		return a.retryWithNewKey(c, info, bodyBytes, errorBody)
 	}
 
-	// 其他 429 错误直接透传
-	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 429 错误，直接透传: %s", errorBody))
+	// 非 14013 错误直接返回
 	return nil, types.NewError(
 		fmt.Errorf("rate limited: %s", errorBody),
 		types.ErrorCodeRateLimited,
@@ -500,13 +505,15 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 			}
 		}
 
-		// 检查 Key 是否在冷却中
-		if ch.ChannelInfo.MultiKeyCooldownUntil != nil {
-			if cooldownUntil, ok := ch.ChannelInfo.MultiKeyCooldownUntil[nextIndex]; ok {
-				if cooldownUntil > now {
-					// 仍在冷却中
-					logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 仍在冷却中，跳过", nextIndex))
-					continue
+		// 检查 Key 是否在冷却中（-ioa 模型跳过冷却检查）
+		if !isIOAModel(info.UpstreamModelName) {
+			if ch.ChannelInfo.MultiKeyCooldownUntil != nil {
+				if cooldownUntil, ok := ch.ChannelInfo.MultiKeyCooldownUntil[nextIndex]; ok {
+					if cooldownUntil > now {
+						// 仍在冷却中
+						logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 仍在冷却中，跳过", nextIndex))
+						continue
+					}
 				}
 			}
 		}

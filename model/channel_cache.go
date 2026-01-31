@@ -106,18 +106,16 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
-// hasAvailableKey checks if a channel has at least one key that is not in cooldown
-// 检查渠道是否有至少一个不在冷却中的 key
-func hasAvailableKey(channel *Channel) bool {
-	// If not in multi-key mode, always return true
-	// 如果不是多 key 模式，始终返回 true
+func hasAvailableKey(channel *Channel, model string) bool {
 	if !channel.ChannelInfo.IsMultiKey {
 		return true
 	}
 
-	// If no cooldown map, all keys are available
-	// 如果没有冷却时间映射，所有 key 都可用
 	if channel.ChannelInfo.MultiKeyCooldownUntil == nil || len(channel.ChannelInfo.MultiKeyCooldownUntil) == 0 {
+		return true
+	}
+
+	if channel.Type == constant.ChannelTypeCodeBuddy && isCodeBuddyIOAModel(model) {
 		return true
 	}
 
@@ -190,7 +188,7 @@ func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel,
 	var availableChannels []int
 	for _, channelId := range channels {
 		if channel, ok := channelsIDM[channelId]; ok {
-			if hasAvailableKey(channel) {
+			if hasAvailableKey(channel, model) {
 				availableChannels = append(availableChannels, channelId)
 			}
 		}
@@ -353,4 +351,8 @@ func CacheUpdateChannel(channel *Channel) {
 	println("before:", channelsIDM[channel.Id].ChannelInfo.MultiKeyPollingIndex)
 	channelsIDM[channel.Id] = channel
 	println("after :", channelsIDM[channel.Id].ChannelInfo.MultiKeyPollingIndex)
+}
+
+func isCodeBuddyIOAModel(model string) bool {
+	return strings.HasSuffix(model, "-ioa")
 }

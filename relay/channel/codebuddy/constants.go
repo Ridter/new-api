@@ -5,19 +5,20 @@ package codebuddy
 // 实际模型列表应通过 FetchCodeBuddyModels 从 API 动态获取
 var ModelList = []string{
 	// craft agent 模型
+	"kimi-k2.5-ioa",
 	"glm-4.7-ioa",
 	"glm-4.6v-ioa",
-	"kimi-k2-thinking",
 	"claude-opus-4.5",
 	"claude-haiku-4.5",
 	"claude-4.5",
 	"claude-4.0",
+	"gpt-5.2-codex",
 	"gpt-5.2",
 	"gpt-5.1",
-	"gpt-5.1-codex",
 	"gpt-5.1-codex-max",
 	"deepseek-v3-2-volc-ioa",
 	"gemini-3.0-flash",
+	"hunyuan-2.0-thinking-ioa",
 	"hunyuan-2.0-instruct-ioa",
 	// 额外的固定模型
 	"claude-haiku-4-5-20251001",

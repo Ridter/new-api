@@ -156,15 +156,25 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 
 	// Collect indexes of enabled keys that are not in cooldown
 	enabledIdx := make([]int, 0, len(keys))
+	// Also collect enabled keys that are in cooldown (for CodeBuddy -ioa model fallback)
+	enabledButCooldownIdx := make([]int, 0, len(keys))
 	for i := range keys {
-		if getStatus(i) == common.ChannelStatusEnabled && !isInCooldown(i) {
-			enabledIdx = append(enabledIdx, i)
+		if getStatus(i) == common.ChannelStatusEnabled {
+			if !isInCooldown(i) {
+				enabledIdx = append(enabledIdx, i)
+			} else {
+				enabledButCooldownIdx = append(enabledButCooldownIdx, i)
+			}
 		}
 	}
 	// If no specific status list or none enabled, return an explicit error so caller can
 	// properly handle a channel with no available keys (e.g. mark channel disabled).
 	// Returning the first key here caused requests to keep using an already-disabled key.
 	if len(enabledIdx) == 0 {
+		if channel.Type == constant.ChannelTypeCodeBuddy && len(enabledButCooldownIdx) > 0 {
+			selectedIdx := enabledButCooldownIdx[rand.Intn(len(enabledButCooldownIdx))]
+			return keys[selectedIdx], selectedIdx, nil
+		}
 		return "", 0, types.NewError(errors.New("no enabled keys"), types.ErrorCodeChannelNoAvailableKey)
 	}
 
