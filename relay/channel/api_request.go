@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -29,6 +30,14 @@ const DebugProxyEnabled = false
 
 // DebugProxyURL 调试代理地址，如 http://127.0.0.1:8080
 const DebugProxyURL = "http://127.0.0.1:8080"
+
+// 用于保存上游请求信息的 context key
+const (
+	KeyUpstreamRequestURL     = "upstream_request_url"
+	KeyUpstreamRequestHeaders = "upstream_request_headers"
+	KeyUpstreamRequestBody    = "upstream_request_body"
+	KeyUpstreamRequestMethod  = "upstream_request_method"
+)
 
 func SetupApiRequestHeader(info *common.RelayInfo, c *gin.Context, req *http.Header) {
 	if info.RelayMode == constant.RelayModeAudioTranscription || info.RelayMode == constant.RelayModeAudioTranslation {
@@ -72,6 +81,17 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if common2.DebugEnabled {
 		println("fullRequestURL:", fullRequestURL)
 	}
+
+	// 读取请求体并保存，同时创建新的 reader
+	var bodyBytes []byte
+	if requestBody != nil {
+		bodyBytes, err = io.ReadAll(requestBody)
+		if err != nil {
+			return nil, fmt.Errorf("read request body failed: %w", err)
+		}
+		requestBody = bytes.NewReader(bodyBytes)
+	}
+
 	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
@@ -88,11 +108,55 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
+
+	// 保存上游请求信息到 context（用于错误日志记录）
+	saveUpstreamRequestInfo(c, req, bodyBytes)
+
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
 	return resp, nil
+}
+
+// saveUpstreamRequestInfo 保存上游请求信息到 context
+func saveUpstreamRequestInfo(c *gin.Context, req *http.Request, bodyBytes []byte) {
+	c.Set(KeyUpstreamRequestURL, req.URL.String())
+	c.Set(KeyUpstreamRequestMethod, req.Method)
+
+	// 保存请求头（隐藏敏感信息）
+	headers := make(map[string]string)
+	sensitiveHeaders := map[string]bool{
+		"authorization":   true,
+		"x-api-key":       true,
+		"api-key":         true,
+		"x-auth-token":    true,
+		"cookie":          true,
+		"x-access-token":  true,
+		"x-secret-key":    true,
+		"x-session-token": true,
+	}
+	for key, values := range req.Header {
+		if len(values) > 0 {
+			lowerKey := strings.ToLower(key)
+			if sensitiveHeaders[lowerKey] {
+				val := values[0]
+				if len(val) > 16 {
+					headers[key] = val[:8] + "..." + val[len(val)-4:]
+				} else {
+					headers[key] = "[REDACTED]"
+				}
+			} else {
+				headers[key] = values[0]
+			}
+		}
+	}
+	c.Set(KeyUpstreamRequestHeaders, headers)
+
+	// 保存请求体
+	if len(bodyBytes) > 0 {
+		c.Set(KeyUpstreamRequestBody, string(bodyBytes))
+	}
 }
 
 func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {

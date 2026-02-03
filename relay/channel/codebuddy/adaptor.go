@@ -27,7 +27,7 @@ import (
 const MaxRateLimitRetries = 3
 
 // EnableGzip 控制是否启用 gzip 压缩，方便调试
-const EnableGzip = true
+const EnableGzip = false
 
 func readResponseBodyWithTimeout(resp *http.Response, timeout time.Duration) ([]byte, error) {
 	if resp == nil || resp.Body == nil {

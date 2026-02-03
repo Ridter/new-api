@@ -374,6 +374,23 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		other["channel_id"] = channelId
 		other["channel_name"] = c.GetString("channel_name")
 		other["channel_type"] = c.GetInt("channel_type")
+		// 保存上游返回的原始错误信息
+		if err.RelayError != nil {
+			other["relay_error"] = err.RelayError
+		}
+		// 保存上游请求信息（用于 Burp 重放调试）
+		if upstreamURL, exists := c.Get("upstream_request_url"); exists {
+			other["upstream_url"] = upstreamURL
+		}
+		if upstreamMethod, exists := c.Get("upstream_request_method"); exists {
+			other["upstream_method"] = upstreamMethod
+		}
+		if upstreamHeaders, exists := c.Get("upstream_request_headers"); exists {
+			other["upstream_headers"] = upstreamHeaders
+		}
+		if upstreamBody, exists := c.Get("upstream_request_body"); exists {
+			other["upstream_body"] = upstreamBody
+		}
 		adminInfo := make(map[string]interface{})
 		adminInfo["use_channel"] = c.GetStringSlice("use_channel")
 		isMultiKey := common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
@@ -385,6 +402,21 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, 0, false, userGroup, other)
 	}
 
+}
+
+// getRequestBodyForLog 获取用于错误日志的完整请求体
+func getRequestBodyForLog(c *gin.Context) (string, error) {
+	cached, exists := c.Get(common.KeyRequestBody)
+	if !exists || cached == nil {
+		return "", nil
+	}
+
+	body, ok := cached.([]byte)
+	if !ok || len(body) == 0 {
+		return "", nil
+	}
+
+	return string(body), nil
 }
 
 func RelayMidjourney(c *gin.Context) {

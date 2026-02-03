@@ -25,6 +25,7 @@ import {
   Tooltip,
   Popover,
   Typography,
+  Button,
 } from '@douyinfe/semi-ui';
 import {
   timestamp2string,
@@ -525,6 +526,177 @@ export const getLogsColumns = ({
       fixed: 'right',
       render: (text, record, index) => {
         let other = getLogOther(record.other);
+        
+        // 错误日志 (type=5) 显示详细错误信息
+        if (record.type === 5) {
+          let errorDetails = [];
+          errorDetails.push(`${t('错误信息')}: ${text}`); // 主要错误信息
+          
+          if (other) {
+            if (other.error_type) {
+              errorDetails.push(`${t('错误类型')}: ${other.error_type}`);
+            }
+            if (other.error_code) {
+              errorDetails.push(`${t('错误代码')}: ${other.error_code}`);
+            }
+            if (other.status_code !== undefined) {
+              errorDetails.push(`${t('状态码')}: ${other.status_code}`);
+            }
+            if (other.channel_name) {
+              errorDetails.push(`${t('渠道')}: ${other.channel_name}`);
+            }
+            if (other.channel_type !== undefined) {
+              errorDetails.push(`${t('渠道类型')}: ${other.channel_type}`);
+            }
+            if (other.upstream_url) {
+              errorDetails.push(`${t('上游URL')}: ${other.upstream_url}`);
+            }
+            // 显示上游返回的原始错误信息
+            if (other.relay_error) {
+              let relayErrorStr = '';
+              if (typeof other.relay_error === 'object') {
+                if (other.relay_error.message) {
+                  relayErrorStr = other.relay_error.message;
+                } else {
+                  relayErrorStr = JSON.stringify(other.relay_error, null, 2);
+                }
+              } else {
+                relayErrorStr = String(other.relay_error);
+              }
+              errorDetails.push(`${t('上游错误')}: ${relayErrorStr}`);
+            }
+            if (other.admin_info) {
+              if (other.admin_info.use_channel && other.admin_info.use_channel.length > 0) {
+                errorDetails.push(`${t('使用渠道')}: ${other.admin_info.use_channel.join(' -> ')}`);
+              }
+              if (other.admin_info.is_multi_key) {
+                errorDetails.push(`${t('多Key索引')}: ${other.admin_info.multi_key_index}`);
+              }
+            }
+          }
+          
+          let errorContent = errorDetails.join('\n');
+          
+          // 生成上游 HTTP 原始请求格式（用于 Burp 重放）
+          const generateUpstreamHttpRequest = () => {
+            if (!other || !other.upstream_url) return null;
+            
+            let httpRequest = '';
+            const method = other.upstream_method || 'POST';
+            
+            // 解析 URL 获取 host 和 path
+            let host = '';
+            let path = '/';
+            try {
+              const url = new URL(other.upstream_url);
+              host = url.host;
+              path = url.pathname + url.search;
+            } catch (e) {
+              path = other.upstream_url;
+            }
+            
+            // 请求行
+            httpRequest += `${method} ${path} HTTP/1.1\r\n`;
+            httpRequest += `Host: ${host}\r\n`;
+            
+            // 请求头
+            if (other.upstream_headers && typeof other.upstream_headers === 'object') {
+              Object.entries(other.upstream_headers).forEach(([key, value]) => {
+                // 跳过 Host 头，已经添加过了
+                if (key.toLowerCase() !== 'host') {
+                  httpRequest += `${key}: ${value}\r\n`;
+                }
+              });
+            }
+            
+            // 空行分隔头部和体
+            httpRequest += '\r\n';
+            
+            // 请求体
+            if (other.upstream_body) {
+              if (typeof other.upstream_body === 'object') {
+                httpRequest += JSON.stringify(other.upstream_body, null, 2);
+              } else {
+                httpRequest += String(other.upstream_body);
+              }
+            }
+            
+            return httpRequest;
+          };
+          
+          // 下载上游请求文件
+          const downloadUpstreamRequest = () => {
+            const httpRequest = generateUpstreamHttpRequest();
+            if (!httpRequest) return;
+            
+            const blob = new Blob([httpRequest], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `upstream_request_${record.id || Date.now()}.txt`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          };
+          
+          // 检查是否有上游请求信息可下载
+          const hasUpstreamData = other && other.upstream_url;
+          
+          return (
+            <Popover
+              content={
+                <div style={{ padding: 12, maxWidth: 900, maxHeight: 700, overflow: 'auto' }}>
+                  {hasUpstreamData && (
+                    <div style={{ marginBottom: 12 }}>
+                      <Button 
+                        size="small" 
+                        type="primary"
+                        onClick={downloadUpstreamRequest}
+                      >
+                        {t('下载上游请求')} (Burp)
+                      </Button>
+                    </div>
+                  )}
+                  <Typography.Text style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: '12px', fontFamily: 'monospace' }}>
+                    {errorContent}
+                  </Typography.Text>
+                  {hasUpstreamData && (
+                    <>
+                      <div style={{ marginTop: 16, borderTop: '1px solid var(--semi-color-border)', paddingTop: 12 }}>
+                        <Typography.Title heading={6}>{t('上游 HTTP 请求')} (可直接导入 Burp Repeater)</Typography.Title>
+                        <pre style={{ 
+                          background: 'var(--semi-color-fill-0)', 
+                          padding: 12, 
+                          borderRadius: 4, 
+                          fontSize: '11px',
+                          maxHeight: 400,
+                          overflow: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-all'
+                        }}>
+                          {generateUpstreamHttpRequest()}
+                        </pre>
+                      </div>
+                    </>
+                  )}
+                </div>
+              }
+              trigger="click"
+              position="leftTop"
+            >
+              <Typography.Paragraph
+                ellipsis={{
+                  rows: 2,
+                }}
+                style={{ maxWidth: 240, cursor: 'pointer', color: 'var(--semi-color-danger)' }}
+              >
+                {text}
+              </Typography.Paragraph>
+            </Popover>
+          );
+        }
+        
         if (other == null || record.type !== 2) {
           return (
             <Typography.Paragraph
