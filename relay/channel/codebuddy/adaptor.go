@@ -175,16 +175,8 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 		return nil, errors.New("request is nil")
 	}
 
-	// 校验 max_tokens / max_completion_tokens 是否超过模型的最大输出 token 限制
-	maxTokens := request.GetMaxTokens()
-	if maxTokens > 0 {
-		if err := ValidateMaxOutputTokens(info.UpstreamModelName, maxTokens); err != nil {
-			logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 输出 token 限制校验失败: %v", err))
-			return nil, err
-		}
-	}
-
 	// 校验输入 token 是否超过模型的最大输入 token 限制
+	// 注意：不校验输出 token（max_tokens），因为 CodeBuddy 返回的 maxOutputTokens 可能偏保守，交给上游自行处理
 	estimatedTokens := info.GetEstimatePromptTokens()
 	if estimatedTokens > 0 {
 		if err := ValidateInputTokens(info.UpstreamModelName, estimatedTokens); err != nil {
@@ -222,14 +214,6 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
 	if request == nil {
 		return nil, errors.New("request is nil")
-	}
-
-	// 校验 Claude 请求的 max_tokens 是否超过模型的最大输出 token 限制
-	if request.MaxTokens > 0 {
-		if err := ValidateMaxOutputTokens(info.UpstreamModelName, request.MaxTokens); err != nil {
-			logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] Claude 输出 token 限制校验失败: %v", err))
-			return nil, err
-		}
 	}
 
 	// 校验输入 token 是否超过模型的最大输入 token 限制
