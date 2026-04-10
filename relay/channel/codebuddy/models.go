@@ -100,6 +100,7 @@ var AdditionalModels = []string{
 
 // FetchCodeBuddyModels 从 CodeBuddy API 获取模型列表
 // 获取 agents 中 name 为 "craft" 的 models，并添加额外的固定模型
+// 同时会自动更新模型 token 限制缓存
 func FetchCodeBuddyModels(baseURL, apiKey string, headerOverride map[string]any) ([]string, error) {
 	url := fmt.Sprintf("%s/v3/config", strings.TrimSuffix(baseURL, "/"))
 
@@ -187,6 +188,9 @@ func FetchCodeBuddyModels(baseURL, apiKey string, headerOverride map[string]any)
 	for _, model := range AdditionalModels {
 		modelSet[model] = true
 	}
+
+	// 同步更新模型 token 限制缓存
+	updateTokenLimitsFromConfig(configResp.Data.Models)
 
 	// 转换为切片
 	result := make([]string, 0, len(modelSet))
@@ -296,4 +300,21 @@ func FetchCodeBuddyModelsWithMetadata(baseURL, apiKey string, headerOverride map
 	}
 
 	return result, nil
+}
+
+// updateTokenLimitsFromConfig 从 config API 返回的模型列表中更新 token 限制缓存
+func updateTokenLimitsFromConfig(models []CodeBuddyModel) {
+	updatedCount := 0
+	for _, model := range models {
+		if model.MaxInputTokens > 0 || model.MaxOutputTokens > 0 {
+			SetModelTokenLimits(model.ID, &ModelTokenLimits{
+				MaxInputTokens:  model.MaxInputTokens,
+				MaxOutputTokens: model.MaxOutputTokens,
+			})
+			updatedCount++
+		}
+	}
+	if updatedCount > 0 {
+		common.SysLog(fmt.Sprintf("[CodeBuddy] 从 config API 更新了 %d 个模型的 token 限制", updatedCount))
+	}
 }
