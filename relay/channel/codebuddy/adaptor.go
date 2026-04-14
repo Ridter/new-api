@@ -278,11 +278,10 @@ func gzipCompress(data []byte) ([]byte, error) {
 }
 
 func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.RelayInfo, compressedBody []byte) (any, error) {
-	// 检查当前 Key 的冷却状态（全局冷却 + 模型频率限制冷却）
-	if !isIOAModel(info.UpstreamModelName) {
-		if err := a.ensureKeyNotInCooldown(c, info, compressedBody); err != nil {
-			return nil, err
-		}
+	// 检查当前 Key 的冷却状态
+	// -ioa 模型跳过全局冷却（14013 额度不受限），但仍检查模型频率冷却（6004）
+	if err := a.ensureKeyNotInCooldown(c, info, compressedBody); err != nil {
+		return nil, err
 	}
 
 	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 发送请求: channel=%d, keyIndex=%d, model=%s", info.ChannelId, info.ChannelMultiKeyIndex, info.UpstreamModelName))
@@ -588,8 +587,9 @@ func (a *Adaptor) readAndCloseResponseBody(c *gin.Context, resp *http.Response) 
 	return string(respBytes)
 }
 
-// ensureKeyNotInCooldown 确保当前 Key 不在冷却中（全局冷却 + 模型频率限制冷却）
-// 如果当前 Key 在冷却中，会尝试切换到其他可用 Key
+// ensureKeyNotInCooldown 确保当前 Key 不在冷却中
+// -ioa 模型：只检查模型频率冷却（6004），跳过全局冷却（14013 额度不受限）
+// 非 -ioa 模型：检查全局冷却 + 模型频率冷却
 func (a *Adaptor) ensureKeyNotInCooldown(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte) error {
 	ch, err := model.CacheGetChannel(info.ChannelId)
 	if err != nil {
@@ -604,9 +604,10 @@ func (a *Adaptor) ensureKeyNotInCooldown(c *gin.Context, info *relaycommon.Relay
 
 	now := time.Now().Unix()
 	needSwitch := false
+	isIOA := isIOAModel(info.UpstreamModelName)
 
-	// 检查全局冷却（如 14013 额度用尽）
-	if cooldownMap != nil {
+	// 检查全局冷却（如 14013 额度用尽），-ioa 模型跳过
+	if !isIOA && cooldownMap != nil {
 		if cooldownUntil, ok := cooldownMap[info.ChannelMultiKeyIndex]; ok && cooldownUntil > now {
 			logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 全局冷却中 (until=%d, now=%d)",
 				info.ChannelMultiKeyIndex, cooldownUntil, now))
@@ -614,7 +615,7 @@ func (a *Adaptor) ensureKeyNotInCooldown(c *gin.Context, info *relaycommon.Relay
 		}
 	}
 
-	// 检查该模型的频率限制冷却（如 6004）
+	// 检查该模型的频率限制冷却（如 6004），所有模型都检查
 	if !needSwitch && modelCooldownMap != nil {
 		if modelMap, ok := modelCooldownMap[info.ChannelMultiKeyIndex]; ok {
 			if cooldownUntil, ok := modelMap[info.UpstreamModelName]; ok && cooldownUntil > now {
@@ -718,6 +719,8 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 	now := time.Now().Unix()
 	currentIndex := info.ChannelMultiKeyIndex
 
+	isIOA := isIOAModel(info.UpstreamModelName)
+
 	for i := 1; i < len(keys); i++ {
 		nextIndex := (currentIndex + i) % len(keys)
 
@@ -731,26 +734,24 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 			}
 		}
 
-		if !isIOAModel(info.UpstreamModelName) {
-			// 检查全局冷却（如 14013 额度用尽）
-			if ch.ChannelInfo.MultiKeyCooldownUntil != nil {
-				if cooldownUntil, ok := ch.ChannelInfo.MultiKeyCooldownUntil[nextIndex]; ok {
-					if cooldownUntil > now {
-						logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 全局冷却中 (until=%d, now=%d)，跳过", nextIndex, cooldownUntil, now))
-						continue
-					}
+		// 检查全局冷却（如 14013 额度用尽），-ioa 模型跳过
+		if !isIOA && ch.ChannelInfo.MultiKeyCooldownUntil != nil {
+			if cooldownUntil, ok := ch.ChannelInfo.MultiKeyCooldownUntil[nextIndex]; ok {
+				if cooldownUntil > now {
+					logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 全局冷却中 (until=%d, now=%d)，跳过", nextIndex, cooldownUntil, now))
+					continue
 				}
 			}
+		}
 
-			// 检查该模型的频率限制冷却（如 6004）
-			if ch.ChannelInfo.MultiKeyModelCooldownUtil != nil {
-				if modelMap, ok := ch.ChannelInfo.MultiKeyModelCooldownUtil[nextIndex]; ok {
-					if cooldownUntil, ok := modelMap[info.UpstreamModelName]; ok {
-						if cooldownUntil > now {
-							logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 模型 %s 频率冷却中 (until=%d, now=%d)，跳过",
-								nextIndex, info.UpstreamModelName, cooldownUntil, now))
-							continue
-						}
+		// 检查该模型的频率限制冷却（如 6004），所有模型都检查
+		if ch.ChannelInfo.MultiKeyModelCooldownUtil != nil {
+			if modelMap, ok := ch.ChannelInfo.MultiKeyModelCooldownUtil[nextIndex]; ok {
+				if cooldownUntil, ok := modelMap[info.UpstreamModelName]; ok {
+					if cooldownUntil > now {
+						logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 模型 %s 频率冷却中 (until=%d, now=%d)，跳过",
+							nextIndex, info.UpstreamModelName, cooldownUntil, now))
+						continue
 					}
 				}
 			}
