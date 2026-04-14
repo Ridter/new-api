@@ -76,20 +76,35 @@ func InitChannelCache() {
 					oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
 					channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
 				}
-				// 保留冷却信息，避免缓存同步时丢失
-				// 数据库中的数据优先，但保留内存中更新的数据（防止持久化延迟导致丢失）
-				if oldChannel.ChannelInfo.MultiKeyCooldownUntil != nil &&
-					len(oldChannel.ChannelInfo.MultiKeyCooldownUntil) > 0 {
-					if channel.ChannelInfo.MultiKeyCooldownUntil == nil {
-						channel.ChannelInfo.MultiKeyCooldownUntil = make(map[int]int64)
+			// 保留冷却信息，避免缓存同步时丢失
+			// 数据库中的数据优先，但保留内存中更新的数据（防止持久化延迟导致丢失）
+			if len(oldChannel.ChannelInfo.MultiKeyCooldownUntil) > 0 {
+				if channel.ChannelInfo.MultiKeyCooldownUntil == nil {
+					channel.ChannelInfo.MultiKeyCooldownUntil = make(map[int]int64)
+				}
+				for keyIdx, cooldownUntil := range oldChannel.ChannelInfo.MultiKeyCooldownUntil {
+					if _, exists := channel.ChannelInfo.MultiKeyCooldownUntil[keyIdx]; !exists {
+						channel.ChannelInfo.MultiKeyCooldownUntil[keyIdx] = cooldownUntil
 					}
-					for keyIdx, cooldownUntil := range oldChannel.ChannelInfo.MultiKeyCooldownUntil {
-						// 如果数据库中没有这个 key 的冷却信息，使用内存中的
-						if _, exists := channel.ChannelInfo.MultiKeyCooldownUntil[keyIdx]; !exists {
-							channel.ChannelInfo.MultiKeyCooldownUntil[keyIdx] = cooldownUntil
+				}
+			}
+			// 保留每个模型的频率限制冷却信息
+			if len(oldChannel.ChannelInfo.MultiKeyModelCooldownUtil) > 0 {
+				if channel.ChannelInfo.MultiKeyModelCooldownUtil == nil {
+					channel.ChannelInfo.MultiKeyModelCooldownUtil = make(map[int]map[string]int64)
+				}
+				for keyIdx, modelMap := range oldChannel.ChannelInfo.MultiKeyModelCooldownUtil {
+					if _, exists := channel.ChannelInfo.MultiKeyModelCooldownUtil[keyIdx]; !exists {
+						channel.ChannelInfo.MultiKeyModelCooldownUtil[keyIdx] = modelMap
+					} else {
+						for model, cooldownUntil := range modelMap {
+							if _, exists := channel.ChannelInfo.MultiKeyModelCooldownUtil[keyIdx][model]; !exists {
+								channel.ChannelInfo.MultiKeyModelCooldownUtil[keyIdx][model] = cooldownUntil
+							}
 						}
 					}
 				}
+			}
 			}
 		}
 	}
@@ -111,7 +126,10 @@ func hasAvailableKey(channel *Channel, model string) bool {
 		return true
 	}
 
-	if channel.ChannelInfo.MultiKeyCooldownUntil == nil || len(channel.ChannelInfo.MultiKeyCooldownUntil) == 0 {
+	hasGlobalCooldown := len(channel.ChannelInfo.MultiKeyCooldownUntil) > 0
+	hasModelCooldown := len(channel.ChannelInfo.MultiKeyModelCooldownUtil) > 0
+
+	if !hasGlobalCooldown && !hasModelCooldown {
 		return true
 	}
 
@@ -127,11 +145,7 @@ func hasAvailableKey(channel *Channel, model string) bool {
 	now := time.Now().Unix()
 	statusList := channel.ChannelInfo.MultiKeyStatusList
 
-	// Check if at least one key is enabled and not in cooldown
-	// 检查是否至少有一个 key 是启用的且不在冷却中
 	for i := range keys {
-		// Check if key is enabled
-		// 检查 key 是否启用
 		keyEnabled := true
 		if statusList != nil {
 			if status, ok := statusList[i]; ok {
@@ -143,18 +157,26 @@ func hasAvailableKey(channel *Channel, model string) bool {
 			continue
 		}
 
-		// Check if key is in cooldown
-		// 检查 key 是否在冷却中
-		if cooldownUntil, ok := channel.ChannelInfo.MultiKeyCooldownUntil[i]; ok {
-			if cooldownUntil > now {
-				// Key is still in cooldown
-				// Key 仍在冷却中
-				continue
+		// Check global cooldown (e.g. quota exhausted 14013)
+		if channel.ChannelInfo.MultiKeyCooldownUntil != nil {
+			if cooldownUntil, ok := channel.ChannelInfo.MultiKeyCooldownUntil[i]; ok {
+				if cooldownUntil > now {
+					continue
+				}
 			}
 		}
 
-		// Found an available key
-		// 找到一个可用的 key
+		// Check per-model cooldown (e.g. frequency limit 6004)
+		if channel.ChannelInfo.MultiKeyModelCooldownUtil != nil {
+			if modelMap, ok := channel.ChannelInfo.MultiKeyModelCooldownUtil[i]; ok {
+				if cooldownUntil, ok := modelMap[model]; ok {
+					if cooldownUntil > now {
+						continue
+					}
+				}
+			}
+		}
+
 		return true
 	}
 

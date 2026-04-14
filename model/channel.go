@@ -59,14 +59,15 @@ type Channel struct {
 }
 
 type ChannelInfo struct {
-	IsMultiKey             bool                  `json:"is_multi_key"`                        // 是否多Key模式
-	MultiKeySize           int                   `json:"multi_key_size"`                      // 多Key模式下的Key数量
-	MultiKeyStatusList     map[int]int           `json:"multi_key_status_list"`               // key状态列表，key index -> status
-	MultiKeyDisabledReason map[int]string        `json:"multi_key_disabled_reason,omitempty"` // key禁用原因列表，key index -> reason
-	MultiKeyDisabledTime   map[int]int64         `json:"multi_key_disabled_time,omitempty"`   // key禁用时间列表，key index -> time
-	MultiKeyCooldownUntil  map[int]int64         `json:"multi_key_cooldown_until,omitempty"`  // key冷却结束时间列表，key index -> unix timestamp
-	MultiKeyPollingIndex   int                   `json:"multi_key_polling_index"`             // 多Key模式下轮询的key索引
-	MultiKeyMode           constant.MultiKeyMode `json:"multi_key_mode"`
+	IsMultiKey                bool                       `json:"is_multi_key"`                              // 是否多Key模式
+	MultiKeySize              int                        `json:"multi_key_size"`                            // 多Key模式下的Key数量
+	MultiKeyStatusList        map[int]int                `json:"multi_key_status_list"`                     // key状态列表，key index -> status
+	MultiKeyDisabledReason    map[int]string             `json:"multi_key_disabled_reason,omitempty"`       // key禁用原因列表，key index -> reason
+	MultiKeyDisabledTime      map[int]int64              `json:"multi_key_disabled_time,omitempty"`         // key禁用时间列表，key index -> time
+	MultiKeyCooldownUntil     map[int]int64              `json:"multi_key_cooldown_until,omitempty"`        // key冷却结束时间列表，key index -> unix timestamp
+	MultiKeyModelCooldownUtil map[int]map[string]int64   `json:"multi_key_model_cooldown_until,omitempty"` // 每个key每个模型的频率限制冷却: key index -> model name -> unix timestamp
+	MultiKeyPollingIndex      int                        `json:"multi_key_polling_index"`                   // 多Key模式下轮询的key索引
+	MultiKeyMode              constant.MultiKeyMode      `json:"multi_key_mode"`
 }
 
 // Value implements driver.Valuer interface

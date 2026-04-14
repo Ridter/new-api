@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -277,16 +278,13 @@ func gzipCompress(data []byte) ([]byte, error) {
 }
 
 func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.RelayInfo, compressedBody []byte) (any, error) {
-	// 对于非 -ioa 模型，检查当前 Key 是否在冷却中
-	// 这是因为 GetNextEnabledKey 会为 CodeBuddy 渠道选择冷却中的 Key（为了支持 -ioa 模型）
-	// 但非 -ioa 模型不能使用冷却中的 Key
+	// 检查当前 Key 的冷却状态（全局冷却 + 模型频率限制冷却）
 	if !isIOAModel(info.UpstreamModelName) {
 		if err := a.ensureKeyNotInCooldown(c, info, compressedBody); err != nil {
 			return nil, err
 		}
 	}
 
-	// 记录当前使用的 Key 信息
 	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 发送请求: channel=%d, keyIndex=%d, model=%s", info.ChannelId, info.ChannelMultiKeyIndex, info.UpstreamModelName))
 
 	resp, err := channel.DoApiRequest(a, c, info, bytes.NewReader(compressedBody))
@@ -296,9 +294,13 @@ func (a *Adaptor) doRequestWithRateLimitRetry(c *gin.Context, info *relaycommon.
 
 	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] DoRequest 响应状态码: %d, keyIndex=%d", resp.StatusCode, info.ChannelMultiKeyIndex))
 
-	// 检查是否是 14013 额度用尽
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return a.handleRateLimitInRequest(c, info, compressedBody, resp)
+	}
+
+	// 500 状态码可能包含 6004 频率限制错误
+	if resp.StatusCode == http.StatusInternalServerError {
+		return a.handlePossibleFrequencyLimit(c, info, compressedBody, resp)
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -475,25 +477,100 @@ func containsErrorCode(body string, code int) bool {
 	return strings.Contains(body, codeStr) || strings.Contains(body, codeStrWithSpace)
 }
 
-// handleRateLimitInRequest 处理 14013 额度用尽错误
+// handleRateLimitInRequest 处理 429 限流错误
 func (a *Adaptor) handleRateLimitInRequest(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte, resp *http.Response) (any, error) {
 	errorBody := a.readAndCloseResponseBody(c, resp)
 
 	// 14013: 额度用尽，冷却到下月1日后切换 Key
 	if containsErrorCode(errorBody, 14013) {
 		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 额度用尽 (14013)，Key index: %d, model: %s: %s", info.ChannelMultiKeyIndex, info.UpstreamModelName, errorBody))
-		// -ioa 模型不设置冷却（理论上不会触发 14013）
 		if !isIOAModel(info.UpstreamModelName) {
 			a.setKeyCooldown(info.ChannelId, info.ChannelMultiKeyIndex, getNextMonthFirstDay())
 		}
 		return a.retryWithNewKey(c, info, bodyBytes, errorBody)
 	}
 
-	// 非 14013 错误直接返回
+	// 6004: 模型频率限制，解析 reset 时间后对该 key+model 设置冷却
+	if containsErrorCode(errorBody, 6004) {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 频率限制 (6004)，Key index: %d, model: %s: %s", info.ChannelMultiKeyIndex, info.UpstreamModelName, errorBody))
+		resetTime := parseFrequencyLimitResetTime(errorBody)
+		a.setKeyModelCooldown(info.ChannelId, info.ChannelMultiKeyIndex, info.UpstreamModelName, resetTime)
+		return a.retryWithNewKey(c, info, bodyBytes, errorBody)
+	}
+
+	// 非已知错误码直接返回
 	return nil, types.NewError(
 		fmt.Errorf("rate limited: %s", errorBody),
 		types.ErrorCodeRateLimited,
 	)
+}
+
+// handlePossibleFrequencyLimit 处理可能包含 6004 频率限制的 500 响应
+// 读取 body 后检查是否为 6004；如不是则重新包装 body 返回原始响应
+func (a *Adaptor) handlePossibleFrequencyLimit(c *gin.Context, info *relaycommon.RelayInfo, requestBody []byte, resp *http.Response) (any, error) {
+	if resp.Body == nil {
+		return resp, nil
+	}
+
+	bodyBytes, err := readResponseBodyWithTimeout(resp, 10*time.Second)
+	resp.Body.Close()
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 读取 500 响应体失败: %v", err))
+		return resp, nil
+	}
+
+	errorBody := string(bodyBytes)
+
+	if containsErrorCode(errorBody, 6004) {
+		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 频率限制 (6004/500)，Key index: %d, model: %s: %s", info.ChannelMultiKeyIndex, info.UpstreamModelName, errorBody))
+		resetTime := parseFrequencyLimitResetTime(errorBody)
+		a.setKeyModelCooldown(info.ChannelId, info.ChannelMultiKeyIndex, info.UpstreamModelName, resetTime)
+		return a.retryWithNewKey(c, info, requestBody, errorBody)
+	}
+
+	// 不是 6004，将 body 重新放回 resp 以便上层处理
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	return resp, nil
+}
+
+var resetTimeRegex = regexp.MustCompile(`reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC([+-]\d+)`)
+
+// parseFrequencyLimitResetTime 从 6004 错误消息中解析 reset 时间
+func parseFrequencyLimitResetTime(errorBody string) time.Time {
+	matches := resetTimeRegex.FindStringSubmatch(errorBody)
+	if len(matches) < 3 {
+		return time.Now().Add(10 * time.Minute)
+	}
+
+	loc, err := time.LoadLocation(fmt.Sprintf("Etc/GMT%s", invertOffset(matches[2])))
+	if err != nil {
+		loc = time.FixedZone("UTC"+matches[2], parseOffsetSeconds(matches[2]))
+	}
+
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", matches[1], loc)
+	if err != nil {
+		return time.Now().Add(10 * time.Minute)
+	}
+	return t
+}
+
+func invertOffset(offset string) string {
+	if strings.HasPrefix(offset, "+") {
+		return "-" + offset[1:]
+	}
+	return "+" + offset[1:]
+}
+
+func parseOffsetSeconds(offset string) int {
+	sign := 1
+	if strings.HasPrefix(offset, "-") {
+		sign = -1
+	}
+	offset = strings.TrimPrefix(offset, "+")
+	offset = strings.TrimPrefix(offset, "-")
+	hours := 0
+	fmt.Sscanf(offset, "%d", &hours)
+	return sign * hours * 3600
 }
 
 // readAndCloseResponseBody 读取并关闭响应体
@@ -511,7 +588,7 @@ func (a *Adaptor) readAndCloseResponseBody(c *gin.Context, resp *http.Response) 
 	return string(respBytes)
 }
 
-// ensureKeyNotInCooldown 确保当前 Key 不在冷却中（仅对非 -ioa 模型）
+// ensureKeyNotInCooldown 确保当前 Key 不在冷却中（全局冷却 + 模型频率限制冷却）
 // 如果当前 Key 在冷却中，会尝试切换到其他可用 Key
 func (a *Adaptor) ensureKeyNotInCooldown(c *gin.Context, info *relaycommon.RelayInfo, bodyBytes []byte) error {
 	ch, err := model.CacheGetChannel(info.ChannelId)
@@ -519,31 +596,43 @@ func (a *Adaptor) ensureKeyNotInCooldown(c *gin.Context, info *relaycommon.Relay
 		return fmt.Errorf("获取渠道信息失败: %w", err)
 	}
 
-	// 获取渠道轮询锁
 	lock := model.GetChannelPollingLock(info.ChannelId)
 	lock.Lock()
 	cooldownMap := ch.ChannelInfo.MultiKeyCooldownUntil
+	modelCooldownMap := ch.ChannelInfo.MultiKeyModelCooldownUtil
 	lock.Unlock()
 
-	if cooldownMap == nil {
+	now := time.Now().Unix()
+	needSwitch := false
+
+	// 检查全局冷却（如 14013 额度用尽）
+	if cooldownMap != nil {
+		if cooldownUntil, ok := cooldownMap[info.ChannelMultiKeyIndex]; ok && cooldownUntil > now {
+			logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 全局冷却中 (until=%d, now=%d)",
+				info.ChannelMultiKeyIndex, cooldownUntil, now))
+			needSwitch = true
+		}
+	}
+
+	// 检查该模型的频率限制冷却（如 6004）
+	if !needSwitch && modelCooldownMap != nil {
+		if modelMap, ok := modelCooldownMap[info.ChannelMultiKeyIndex]; ok {
+			if cooldownUntil, ok := modelMap[info.UpstreamModelName]; ok && cooldownUntil > now {
+				logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 模型 %s 频率冷却中 (until=%d, now=%d)",
+					info.ChannelMultiKeyIndex, info.UpstreamModelName, cooldownUntil, now))
+				needSwitch = true
+			}
+		}
+	}
+
+	if !needSwitch {
 		return nil
 	}
 
-	now := time.Now().Unix()
-	cooldownUntil, inCooldown := cooldownMap[info.ChannelMultiKeyIndex]
-	if !inCooldown || cooldownUntil <= now {
-		return nil // Key 不在冷却中，可以正常使用
-	}
-
-	// 当前 Key 在冷却中，需要切换
-	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 当前 Key index %d 在冷却中 (until=%d, now=%d)，尝试切换到其他 Key",
-		info.ChannelMultiKeyIndex, cooldownUntil, now))
-
 	if err := a.switchToNextAvailableKey(c, info); err != nil {
 		logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 切换 Key 失败: %v，当前渠道无可用 Key", err))
-		// 当前渠道所有 Key 都不可用，返回 channel error 让上层尝试切换渠道
 		return types.NewErrorWithStatusCode(
-			fmt.Errorf("all keys in cooldown for non-ioa model in channel %d", info.ChannelId),
+			fmt.Errorf("all keys in cooldown for model %s in channel %d", info.UpstreamModelName, info.ChannelId),
 			types.ErrorCodeChannelInvalidKey,
 			http.StatusPaymentRequired,
 		)
@@ -553,7 +642,7 @@ func (a *Adaptor) ensureKeyNotInCooldown(c *gin.Context, info *relaycommon.Relay
 	return nil
 }
 
-// setKeyCooldown 设置指定 Key 的冷却时间（针对所有非 -ioa 模型）
+// setKeyCooldown 设置指定 Key 的全局冷却时间（针对所有非 -ioa 模型，如 14013 额度用尽）
 func (a *Adaptor) setKeyCooldown(channelId int, keyIndex int, resetTime time.Time) {
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
@@ -561,44 +650,67 @@ func (a *Adaptor) setKeyCooldown(channelId int, keyIndex int, resetTime time.Tim
 		return
 	}
 
-	// 获取渠道轮询锁
 	lock := model.GetChannelPollingLock(channelId)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 初始化冷却时间 map
 	if ch.ChannelInfo.MultiKeyCooldownUntil == nil {
 		ch.ChannelInfo.MultiKeyCooldownUntil = make(map[int]int64)
 	}
 
-	// 设置冷却结束时间（Unix 时间戳）
 	ch.ChannelInfo.MultiKeyCooldownUntil[keyIndex] = resetTime.Unix()
 
-	common.SysLog(fmt.Sprintf("[CodeBuddy] 设置冷却: channel=%d, keyIndex=%d, until=%s",
-		channelId, keyIndex, resetTime.Format("2006-01-02")))
+	common.SysLog(fmt.Sprintf("[CodeBuddy] 设置全局冷却: channel=%d, keyIndex=%d, until=%s",
+		channelId, keyIndex, resetTime.Format("2006-01-02 15:04:05")))
 
-	// 持久化到数据库
 	if err := ch.SaveChannelInfo(); err != nil {
 		common.SysError(fmt.Sprintf("[CodeBuddy] 保存冷却信息失败: %v", err))
 	}
 }
 
-// switchToNextAvailableKey 切换到下一个可用的 Key（跳过冷却中的 Key）
+// setKeyModelCooldown 设置指定 Key 针对特定模型的频率限制冷却时间（如 6004 频率限制）
+func (a *Adaptor) setKeyModelCooldown(channelId int, keyIndex int, modelName string, resetTime time.Time) {
+	ch, err := model.CacheGetChannel(channelId)
+	if err != nil {
+		common.SysError(fmt.Sprintf("[CodeBuddy] setKeyModelCooldown 获取渠道失败: %v", err))
+		return
+	}
+
+	lock := model.GetChannelPollingLock(channelId)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if ch.ChannelInfo.MultiKeyModelCooldownUtil == nil {
+		ch.ChannelInfo.MultiKeyModelCooldownUtil = make(map[int]map[string]int64)
+	}
+	if ch.ChannelInfo.MultiKeyModelCooldownUtil[keyIndex] == nil {
+		ch.ChannelInfo.MultiKeyModelCooldownUtil[keyIndex] = make(map[string]int64)
+	}
+
+	ch.ChannelInfo.MultiKeyModelCooldownUtil[keyIndex][modelName] = resetTime.Unix()
+
+	common.SysLog(fmt.Sprintf("[CodeBuddy] 设置模型频率冷却: channel=%d, keyIndex=%d, model=%s, until=%s",
+		channelId, keyIndex, modelName, resetTime.Format("2006-01-02 15:04:05")))
+
+	if err := ch.SaveChannelInfo(); err != nil {
+		common.SysError(fmt.Sprintf("[CodeBuddy] 保存模型频率冷却信息失败: %v", err))
+	}
+}
+
+// switchToNextAvailableKey 切换到下一个可用的 Key（跳过冷却中和模型频率限制的 Key）
 func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.RelayInfo) error {
 	ch, err := model.CacheGetChannel(info.ChannelId)
 	if err != nil {
 		return fmt.Errorf("获取渠道信息失败: %w", err)
 	}
 
-	// 获取所有 Key
 	keys := ch.GetKeys()
-	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] switchToNextAvailableKey: 总共 %d 个 Key, 当前 index: %d", len(keys), info.ChannelMultiKeyIndex))
+	logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] switchToNextAvailableKey: 总共 %d 个 Key, 当前 index: %d, model: %s", len(keys), info.ChannelMultiKeyIndex, info.UpstreamModelName))
 
 	if len(keys) <= 1 {
 		return errors.New("没有其他可用的 Key")
 	}
 
-	// 获取渠道轮询锁
 	lock := model.GetChannelPollingLock(info.ChannelId)
 	lock.Lock()
 	defer lock.Unlock()
@@ -606,7 +718,6 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 	now := time.Now().Unix()
 	currentIndex := info.ChannelMultiKeyIndex
 
-	// 查找下一个不在冷却中的 Key
 	for i := 1; i < len(keys); i++ {
 		nextIndex := (currentIndex + i) % len(keys)
 
@@ -620,31 +731,41 @@ func (a *Adaptor) switchToNextAvailableKey(c *gin.Context, info *relaycommon.Rel
 			}
 		}
 
-		// 检查 Key 是否在冷却中（-ioa 模型跳过冷却检查）
 		if !isIOAModel(info.UpstreamModelName) {
+			// 检查全局冷却（如 14013 额度用尽）
 			if ch.ChannelInfo.MultiKeyCooldownUntil != nil {
 				if cooldownUntil, ok := ch.ChannelInfo.MultiKeyCooldownUntil[nextIndex]; ok {
 					if cooldownUntil > now {
-						// 仍在冷却中
-						logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 仍在冷却中 (until=%d, now=%d)，跳过", nextIndex, cooldownUntil, now))
+						logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 全局冷却中 (until=%d, now=%d)，跳过", nextIndex, cooldownUntil, now))
 						continue
+					}
+				}
+			}
+
+			// 检查该模型的频率限制冷却（如 6004）
+			if ch.ChannelInfo.MultiKeyModelCooldownUtil != nil {
+				if modelMap, ok := ch.ChannelInfo.MultiKeyModelCooldownUtil[nextIndex]; ok {
+					if cooldownUntil, ok := modelMap[info.UpstreamModelName]; ok {
+						if cooldownUntil > now {
+							logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] Key index %d 模型 %s 频率冷却中 (until=%d, now=%d)，跳过",
+								nextIndex, info.UpstreamModelName, cooldownUntil, now))
+							continue
+						}
 					}
 				}
 			}
 		}
 
-		// 找到可用的 Key
 		info.ApiKey = keys[nextIndex]
 		info.ChannelMultiKeyIndex = nextIndex
-
-		// 更新轮询索引
 		ch.ChannelInfo.MultiKeyPollingIndex = (nextIndex + 1) % len(keys)
 
 		logger.LogInfo(c, fmt.Sprintf("[CodeBuddy] 已切换 API Key: index %d -> %d", currentIndex, nextIndex))
 		return nil
 	}
 
-	logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 所有 Key 都不可用! cooldownMap=%v, statusList=%v", ch.ChannelInfo.MultiKeyCooldownUntil, ch.ChannelInfo.MultiKeyStatusList))
+	logger.LogWarn(c, fmt.Sprintf("[CodeBuddy] 所有 Key 都不可用! globalCooldown=%v, modelCooldown=%v, statusList=%v",
+		ch.ChannelInfo.MultiKeyCooldownUntil, ch.ChannelInfo.MultiKeyModelCooldownUtil, ch.ChannelInfo.MultiKeyStatusList))
 	return errors.New("所有 Key 都在冷却中或被禁用")
 }
 
